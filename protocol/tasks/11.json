@@ -1,0 +1,55 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 11,
+  "objective": "Correct dependency acceptance so a dependency passes only when its Issue is closed by a genuinely merged pull request, using GitHub data that is actually present in gh CLI responses.",
+  "scope": {
+    "write": [
+      "tools/gpp.py",
+      "tests/test_gpp.py",
+      "docs/protocol/dependency-validation.md"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "AGENTS.md",
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/**",
+      "acceptance/**",
+      "deploy/**",
+      "Dockerfile"
+    ]
+  },
+  "inputs": [
+    "tools/gpp.py",
+    "tests/test_gpp.py",
+    "protocol/v0.1/README.md"
+  ],
+  "dependencies": [],
+  "acceptance": {
+    "commands": [
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo",
+      "python3 -m py_compile tools/gpp.py",
+      "git diff --check"
+    ],
+    "assertions": [
+      "A closed dependency Issue with at least one linked PR whose live PR data reports a non-null mergedAt is accepted.",
+      "A closed dependency Issue linked only to an open or closed-unmerged PR is rejected.",
+      "An open dependency Issue is rejected even if a malformed or unrelated PR reference is present.",
+      "Regression tests model the actual gh issue view response in which closedByPullRequestsReferences provides PR numbers and URLs but not nested mergedAt.",
+      "All GitHub lookups remain read-only and lookup or schema failures produce an explicit protocol error rather than a false acceptance."
+    ]
+  },
+  "deliverables": [
+    "Corrected dependency validation in tools/gpp.py",
+    "Deterministic unit regressions for merged, closed-unmerged, open, and lookup-failure cases",
+    "Short evidence note describing the observed gh CLI response boundary"
+  ],
+  "risks": [
+    "Additional per-dependency PR lookups can increase validation latency.",
+    "Relying on undocumented nested gh JSON fields can recreate the false rejection.",
+    "A permissive fallback on API failure could falsely accept unresolved dependencies."
+  ],
+  "notes": "The bug was confirmed against Issue #1 and merged PR #8: gh issue view emitted only id/number/repository/url for closedByPullRequestsReferences, while GraphQL showed merged=true and mergedAt."
+}

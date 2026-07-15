@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import call, patch
 
 MODULE_PATH = Path(__file__).parents[1] / "tools" / "gpp.py"
 spec = importlib.util.spec_from_file_location("gpp", MODULE_PATH)
@@ -79,6 +80,113 @@ class ScopeTests(unittest.TestCase):
         contract["scope"]["write"].append(".github/**")
         with self.assertRaisesRegex(gpp.ProtocolError, "forbidden paths"):
             gpp.validate_paths([".github/workflows/ci.yml"], contract)
+
+
+class DependencyTests(unittest.TestCase):
+    root = Path("/repo")
+
+    @staticmethod
+    def issue(state="CLOSED", references=None):
+        if references is None:
+            references = [
+                {
+                    "id": "PR_linked",
+                    "number": 8,
+                    "repository": {
+                        "id": "R_repo",
+                        "name": "hyperliquid-sim",
+                        "owner": {"id": "U_owner", "login": "kfastov"},
+                    },
+                    "url": "https://github.com/kfastov/hyperliquid-sim/pull/8",
+                }
+            ]
+        return {"closedByPullRequestsReferences": references, "state": state}
+
+    @patch.object(gpp, "gh_json")
+    def test_closed_issue_with_merged_linked_pr_is_accepted(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            self.issue(),
+            {
+                "mergeCommit": {"oid": "723c5f7"},
+                "mergedAt": "2026-07-15T11:57:25Z",
+                "state": "MERGED",
+            },
+        ]
+
+        gpp.validate_dependencies(self.root, [1])
+
+        self.assertEqual(
+            mock_gh_json.call_args_list,
+            [
+                call(
+                    [
+                        "issue",
+                        "view",
+                        "1",
+                        "--json",
+                        "state,closedByPullRequestsReferences",
+                    ],
+                    self.root,
+                ),
+                call(
+                    ["pr", "view", "8", "--json", "state,mergedAt,mergeCommit"],
+                    self.root,
+                ),
+            ],
+        )
+
+    @patch.object(gpp, "gh_json")
+    def test_closed_issue_with_only_closed_unmerged_pr_is_rejected(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            self.issue(),
+            {"mergeCommit": None, "mergedAt": None, "state": "CLOSED"},
+        ]
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "not accepted by merged PR"):
+            gpp.validate_dependencies(self.root, [1])
+
+        self.assertEqual(mock_gh_json.call_count, 2)
+
+    @patch.object(gpp, "gh_json")
+    def test_closed_issue_with_only_open_pr_is_rejected(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            self.issue(),
+            {"mergeCommit": None, "mergedAt": None, "state": "OPEN"},
+        ]
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "not accepted by merged PR"):
+            gpp.validate_dependencies(self.root, [1])
+
+        self.assertEqual(mock_gh_json.call_count, 2)
+
+    @patch.object(gpp, "gh_json")
+    def test_open_issue_is_rejected_without_pr_lookup(self, mock_gh_json):
+        mock_gh_json.return_value = self.issue(
+            state="OPEN",
+            references=[{"number": "malformed", "url": "https://example.invalid"}],
+        )
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "Issue is not closed"):
+            gpp.validate_dependencies(self.root, [1])
+
+        mock_gh_json.assert_called_once()
+
+    @patch.object(gpp, "gh_json")
+    def test_lookup_failure_is_an_explicit_protocol_error(self, mock_gh_json):
+        mock_gh_json.side_effect = gpp.ProtocolError("command failed (1): gh issue view")
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "dependency #1 lookup failed"):
+            gpp.validate_dependencies(self.root, [1])
+
+    @patch.object(gpp, "gh_json")
+    def test_pr_schema_failure_is_an_explicit_protocol_error(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            self.issue(),
+            {"mergeCommit": {"oid": "723c5f7"}, "state": "MERGED"},
+        ]
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "linked PR #8 has invalid schema"):
+            gpp.validate_dependencies(self.root, [1])
 
 
 if __name__ == "__main__":
