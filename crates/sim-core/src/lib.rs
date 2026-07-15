@@ -88,6 +88,8 @@ pub enum PlacementDisposition {
 pub enum PlacementReject {
     #[error("ALO order would immediately match")]
     MarketableAlo,
+    #[error("order would trade against the same user")]
+    SelfTrade,
     #[error("account arithmetic overflow")]
     ArithmeticOverflow,
 }
@@ -440,8 +442,9 @@ impl Engine {
         timestamp: LogicalTimestamp,
         request: PlaceOrder,
     ) -> PlacementStatus {
-        // Entry-level checkpoint makes arithmetic failure and ALO rejection
-        // mutation-free, while preserving prior successful batch entries.
+        // Entry-level checkpoint makes arithmetic failure, ALO rejection, and
+        // self-trade rejection mutation-free, while preserving prior successful
+        // batch entries.
         let checkpoint = self.clone();
         match self.place_one_inner(user, timestamp, request) {
             Ok(status) => status,
@@ -626,7 +629,7 @@ impl Engine {
         quantity_lots: u64,
     ) -> Result<(), PlacementReject> {
         if taker.user == maker.user {
-            return Ok(());
+            return Err(PlacementReject::SelfTrade);
         }
         let quantity = i128::from(quantity_lots);
         let notional = i128::from(maker.price.value())

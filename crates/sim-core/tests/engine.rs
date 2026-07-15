@@ -195,6 +195,54 @@ fn marketable_alo_is_atomic_but_non_marketable_alo_rests() {
 }
 
 #[test]
+fn same_user_crossing_is_rejected_without_mutation_or_id_consumption() {
+    let mut engine = Engine::new(31);
+    let owner = user('a');
+    let maker_id = accepted_id(
+        &place(
+            &mut engine,
+            &owner,
+            1,
+            vec![order(AssetId::BTC, Side::Ask, 100, 3, TimeInForce::Gtc)],
+        )[0],
+    );
+    let snapshot_before = engine.snapshot();
+    let events_before = engine.events().to_vec();
+
+    let rejected = place(
+        &mut engine,
+        &owner,
+        2,
+        vec![order(AssetId::BTC, Side::Bid, 100, 2, TimeInForce::Gtc)],
+    );
+
+    assert_eq!(rejected, vec![PlacementStatus::Rejected { reason: PlacementReject::SelfTrade }]);
+    assert_eq!(engine.snapshot(), snapshot_before);
+    assert_eq!(engine.events(), events_before);
+    assert_eq!(engine.order(maker_id).unwrap().remaining_lots, 3);
+
+    let outsider = user('b');
+    let accepted = place(
+        &mut engine,
+        &outsider,
+        3,
+        vec![order(AssetId::BTC, Side::Bid, 100, 2, TimeInForce::Gtc)],
+    );
+    assert!(matches!(accepted[0], PlacementStatus::Accepted { order_id: 2, .. }));
+    let fills: Vec<_> = engine
+        .events()
+        .iter()
+        .filter_map(|record| match &record.event {
+            Event::Fill { fill } => Some(fill),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].trade_id, 1);
+    assert_eq!(fills[0].maker_order_id, maker_id);
+}
+
+#[test]
 fn batch_is_ordered_and_allows_partial_success() {
     let mut engine = Engine::new(4);
     let maker = user('a');
