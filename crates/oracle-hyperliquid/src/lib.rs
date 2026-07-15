@@ -9,7 +9,7 @@ use hl_wire::{AssetId, DecimalScale, PriceTicks, WireValueError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     future::Future,
     pin::Pin,
@@ -550,17 +550,30 @@ pub fn parse_meta_and_asset_ctxs(
     }
 
     let mut observations = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    let mut first_error = None;
     for (metadata, context) in universe.iter().zip(contexts) {
         let Some(symbol) = metadata.get("name").and_then(Value::as_str) else {
-            return Err(OracleParseError::Malformed);
+            first_error.get_or_insert(OracleParseError::Malformed);
+            continue;
         };
         let Ok(asset) = AssetId::from_symbol(symbol) else {
             continue;
         };
-        let oracle_px =
-            context.get("oraclePx").and_then(Value::as_str).ok_or(OracleParseError::Malformed)?;
-        let price = PriceTicks::parse(oracle_px, scales.for_asset(asset))
-            .map_err(OracleParseError::InvalidPrice)?;
+        if ambiguous.contains(&asset) {
+            continue;
+        }
+        let Some(oracle_px) = context.get("oraclePx").and_then(Value::as_str) else {
+            first_error.get_or_insert(OracleParseError::Malformed);
+            continue;
+        };
+        let price = match PriceTicks::parse(oracle_px, scales.for_asset(asset)) {
+            Ok(price) => price,
+            Err(error) => {
+                first_error.get_or_insert(OracleParseError::InvalidPrice(error));
+                continue;
+            }
+        };
         let observation = OracleObservation {
             asset,
             price,
@@ -569,8 +582,15 @@ pub fn parse_meta_and_asset_ctxs(
             source: ObservationSource::MetaAndAssetCtxs,
         };
         if observations.insert(asset, observation).is_some() {
-            return Err(OracleParseError::AmbiguousAsset);
+            observations.remove(&asset);
+            ambiguous.insert(asset);
+            first_error.get_or_insert(OracleParseError::AmbiguousAsset);
         }
+    }
+    if observations.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
     }
     Ok(observations.into_values().collect())
 }
@@ -609,6 +629,24 @@ impl OracleState {
         }
         self.observations.insert(observation.asset, observation);
         Ok(())
+    }
+
+    /// Fails one asset closed without changing independent asset state.
+    pub fn mark_unavailable(&mut self, asset: AssetId) {
+        self.observations.remove(&asset);
+    }
+
+    pub fn apply_ingest_event(
+        &mut self,
+        event: OracleIngestEvent,
+    ) -> Result<(), ObservationReject> {
+        match event {
+            OracleIngestEvent::Unavailable { asset, .. } => {
+                self.mark_unavailable(asset);
+                Ok(())
+            }
+            OracleIngestEvent::Observation(observation) => self.observe(observation),
+        }
     }
 
     #[must_use]
@@ -706,6 +744,237 @@ impl ReconnectBackoff {
         let delay = self.next_ms;
         self.next_ms = self.next_ms.saturating_mul(2).min(self.maximum_ms);
         Duration::from_millis(delay)
+    }
+
+    #[must_use]
+    pub const fn maximum_delay(&self) -> Duration {
+        Duration::from_millis(self.maximum_ms)
+    }
+}
+
+/// Creates a new transport for every connection attempt. Reusing a socket after
+/// a disconnect is deliberately not expressible through the orchestrator.
+pub trait TransportFactory: Send {
+    type Transport: OracleTransport;
+
+    fn create(&mut self) -> Self::Transport;
+}
+
+impl<F, T> TransportFactory for F
+where
+    F: FnMut() -> T + Send,
+    T: OracleTransport,
+{
+    type Transport = T;
+
+    fn create(&mut self) -> Self::Transport {
+        self()
+    }
+}
+
+/// Injectable delay boundary used by reconnect tests and production Tokio time.
+pub trait Sleeper: Send {
+    fn sleep(&mut self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TokioSleeper;
+
+impl Sleeper for TokioSleeper {
+    fn sleep(&mut self, delay: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(delay))
+    }
+}
+
+/// Injectable reconnect jitter. The orchestrator clamps the result to the
+/// configured backoff maximum, so an implementation cannot defeat the bound.
+pub trait Jitter: Send {
+    fn apply(&mut self, base: Duration) -> Duration;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoJitter;
+
+impl Jitter for NoJitter {
+    fn apply(&mut self, base: Duration) -> Duration {
+        base
+    }
+}
+
+/// Ordered state transitions emitted by resilient ingestion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OracleIngestEvent {
+    /// The shared primary stream is unavailable for this asset. Consumers must
+    /// fail closed until a subsequent fallback or WebSocket observation arrives.
+    Unavailable {
+        asset: AssetId,
+        at_ms: u64,
+    },
+    Observation(OracleObservation),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrchestratorExit {
+    Shutdown,
+    OutputClosed,
+}
+
+/// WS-primary/HTTP-fallback ingestion with fully injectable transition inputs.
+pub struct OracleOrchestrator<F, S, J, C> {
+    factory: F,
+    sleeper: S,
+    jitter: J,
+    clock: C,
+    backoff: ReconnectBackoff,
+    scales: PriceScales,
+}
+
+impl<F, S, J, C> OracleOrchestrator<F, S, J, C>
+where
+    F: TransportFactory,
+    S: Sleeper,
+    J: Jitter,
+    C: Clock,
+{
+    #[must_use]
+    pub const fn new(
+        factory: F,
+        sleeper: S,
+        jitter: J,
+        clock: C,
+        backoff: ReconnectBackoff,
+        scales: PriceScales,
+    ) -> Self {
+        Self { factory, sleeper, jitter, clock, backoff, scales }
+    }
+
+    /// Runs until cancellation or until the bounded observation consumer closes.
+    /// Every failed connect/read marks all assets unavailable, immediately tries
+    /// the fixed HTTP fallback, sleeps once, and then creates a fresh transport.
+    pub async fn run(
+        mut self,
+        output: tokio::sync::mpsc::Sender<OracleIngestEvent>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> OrchestratorExit {
+        let mut sequence = 0_u64;
+
+        loop {
+            let mut transport = self.factory.create();
+            let connected = match until_shutdown(&mut shutdown, transport.connect()).await {
+                Some(result) => result.is_ok(),
+                None => return OrchestratorExit::Shutdown,
+            };
+
+            if connected {
+                loop {
+                    let candidate = sequence.saturating_add(1);
+                    let read = until_shutdown(
+                        &mut shutdown,
+                        transport.next_active_asset_ctx(candidate, self.scales),
+                    )
+                    .await;
+                    match read {
+                        None => return OrchestratorExit::Shutdown,
+                        Some(Ok(observation)) => {
+                            sequence = candidate;
+                            if send_event(
+                                &output,
+                                &mut shutdown,
+                                OracleIngestEvent::Observation(observation),
+                            )
+                            .await
+                            .is_none()
+                            {
+                                return exit_for(&shutdown);
+                            }
+                            // A connection is not considered recovered until it yields
+                            // its first valid WS observation.
+                            self.backoff.reset();
+                        }
+                        Some(Err(_)) => break,
+                    }
+                }
+            }
+
+            let unavailable_at_ms = self.clock.now_ms();
+            for asset in AssetId::ALL {
+                if send_event(
+                    &output,
+                    &mut shutdown,
+                    OracleIngestEvent::Unavailable { asset, at_ms: unavailable_at_ms },
+                )
+                .await
+                .is_none()
+                {
+                    return exit_for(&shutdown);
+                }
+            }
+
+            let fallback_sequence = sequence.saturating_add(1);
+            let fallback = until_shutdown(
+                &mut shutdown,
+                transport.meta_and_asset_ctxs(fallback_sequence, self.scales),
+            )
+            .await;
+            match fallback {
+                None => return OrchestratorExit::Shutdown,
+                Some(Ok(observations)) => {
+                    sequence = fallback_sequence;
+                    for observation in observations {
+                        if send_event(
+                            &output,
+                            &mut shutdown,
+                            OracleIngestEvent::Observation(observation),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return exit_for(&shutdown);
+                        }
+                    }
+                }
+                Some(Err(_)) => {}
+            }
+
+            let base = self.backoff.next_delay();
+            let delay = self.jitter.apply(base).min(self.backoff.maximum_delay());
+            if until_shutdown(&mut shutdown, self.sleeper.sleep(delay)).await.is_none() {
+                return OrchestratorExit::Shutdown;
+            }
+        }
+    }
+}
+
+fn exit_for(shutdown: &tokio::sync::watch::Receiver<bool>) -> OrchestratorExit {
+    if *shutdown.borrow() { OrchestratorExit::Shutdown } else { OrchestratorExit::OutputClosed }
+}
+
+async fn send_event(
+    output: &tokio::sync::mpsc::Sender<OracleIngestEvent>,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    event: OracleIngestEvent,
+) -> Option<()> {
+    until_shutdown(shutdown, output.send(event)).await.and_then(Result::ok)
+}
+
+async fn until_shutdown<F: Future>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    future: F,
+) -> Option<F::Output> {
+    tokio::pin!(future);
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
+            result = &mut future => return Some(result),
+        }
     }
 }
 
@@ -829,6 +1098,20 @@ mod tests {
     }
 
     #[test]
+    fn malformed_one_asset_fallback_does_not_poison_valid_assets() {
+        let mixed = json!([
+            {"universe":[{"name":"BTC"},{"name":"ETH"},{"name":"SOL"}]},
+            [{"oraclePx":"60000.00"},{"oraclePx":"not-a-price"},{"oraclePx":"140.00"}]
+        ]);
+        let observations =
+            parse_meta_and_asset_ctxs(&mixed, 10, 7, scales()).expect("valid assets survive");
+        assert_eq!(
+            observations.iter().map(|item| item.asset).collect::<Vec<_>>(),
+            [AssetId::BTC, AssetId::SOL]
+        );
+    }
+
+    #[test]
     fn malformed_non_positive_and_ambiguous_fallback_is_rejected() {
         let zero = json!([{"universe":[{"name":"ETH"}]}, [{"oraclePx":"0"}]]);
         assert_eq!(
@@ -872,6 +1155,14 @@ mod tests {
         assert_eq!(state.observation(AssetId::ETH).expect("ETH retained").price.value(), 2_000);
         assert_eq!(state.freshness(AssetId::SOL, clock.now_ms()), OracleFreshness::Missing);
         assert_eq!(state.freshness(AssetId::BTC, 999), OracleFreshness::FutureObservation);
+        state
+            .apply_ingest_event(OracleIngestEvent::Unavailable {
+                asset: AssetId::ETH,
+                at_ms: clock.now_ms(),
+            })
+            .expect("unavailability transition");
+        assert_eq!(state.freshness(AssetId::ETH, clock.now_ms()), OracleFreshness::Missing);
+        assert!(state.observation(AssetId::BTC).is_some(), "other assets remain available");
     }
 
     struct FakeUpstream {
