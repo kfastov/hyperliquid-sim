@@ -167,20 +167,33 @@ fn app_with_config(
     router_with_config(runtime, market, config)
 }
 
+async fn post_raw(
+    app: axum::Router,
+    path: &str,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+    user: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::post(path);
+    if let Some(content_type) = content_type {
+        request = request.header("content-type", content_type);
+    }
+    if let Some(user) = user {
+        request = request.header("x-sim-user", user);
+    }
+    let response = app.oneshot(request.body(body.into()).unwrap()).await.unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
 async fn post(
     app: axum::Router,
     path: &str,
     body: Value,
     user: Option<&str>,
 ) -> (StatusCode, Value) {
-    let mut request = Request::post(path).header("content-type", "application/json");
-    if let Some(user) = user {
-        request = request.header("x-sim-user", user);
-    }
-    let response = app.oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
-    let status = response.status();
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    post_raw(app, path, body.to_string(), Some("application/json"), user).await
 }
 
 fn exchange(action: Value) -> Value {
@@ -315,6 +328,44 @@ async fn malformed_json_and_signature_are_invalid_request() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let (_, body) = post(app, "/exchange", json!({"action":{"type":"cancel","cancels":[]},"nonce":1,"signature":{"r":"bad","s":SIG,"v":27},"vaultAddress":null}), Some(ALICE)).await;
+    assert_eq!(body["error"]["category"], "invalid_request");
+}
+
+#[tokio::test]
+async fn json_media_type_and_body_failures_have_stable_http_errors() {
+    let app = app_with_config(
+        runtime(),
+        market(None),
+        HttpConfig {
+            max_batch: 8,
+            max_body_bytes: 32,
+            max_observation_age_ms: 60_000,
+            runtime_reply_timeout: Duration::from_secs(1),
+        },
+    );
+    let valid_body = r#"{"type":"meta"}"#;
+
+    for content_type in [None, Some("text/plain"), Some("application/json; charset")] {
+        let (status, body) = post_raw(app.clone(), "/info", valid_body, content_type, None).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(body["error"]["category"], "invalid_request");
+    }
+
+    for content_type in ["application/json", "APPLICATION/JSON", "application/json; charset=utf-8"]
+    {
+        let (status, body) =
+            post_raw(app.clone(), "/info", valid_body, Some(content_type), None).await;
+        assert_eq!(status, StatusCode::OK, "content-type={content_type}, body={body}");
+        assert!(body["universe"].is_array());
+    }
+
+    let (status, body) = post_raw(app.clone(), "/info", "{", Some("application/json"), None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["category"], "invalid_request");
+
+    let oversized = format!(r#"{{"type":"meta","padding":"{}"}}"#, "x".repeat(32));
+    let (status, body) = post_raw(app, "/info", oversized, Some("application/json"), None).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(body["error"]["category"], "invalid_request");
 }
 

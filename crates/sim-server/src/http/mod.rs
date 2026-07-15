@@ -5,7 +5,8 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, State, rejection::BytesRejection},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    response::IntoResponse,
     routing::post,
 };
 use hl_wire::{
@@ -101,9 +102,12 @@ async fn info(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResponse {
+    if !has_json_content_type(&headers) {
+        return unsupported_media_type();
+    }
     let body = match body {
         Ok(body) => body,
-        Err(_) => return invalid("request body exceeds the configured limit"),
+        Err(rejection) => return body_rejection(rejection),
     };
     let value = match decode_json(&body) {
         Ok(value) => value,
@@ -195,13 +199,16 @@ async fn exchange(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> ApiResponse {
+    if !has_json_content_type(&headers) {
+        return unsupported_media_type();
+    }
     let user = match authority(&headers) {
         Ok(user) => user,
         Err(response) => return response,
     };
     let body = match body {
         Ok(body) => body,
-        Err(_) => return invalid("request body exceeds the configured limit"),
+        Err(rejection) => return body_rejection(rejection),
     };
     let value = match decode_json(&body) {
         Ok(value) => value,
@@ -536,6 +543,135 @@ fn decode_json(body: &[u8]) -> Result<Value, ApiResponse> {
     serde_json::from_slice(body).map_err(|_| invalid("malformed JSON request"))
 }
 
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value.to_str().is_ok_and(is_json_media_type)
+}
+
+fn is_json_media_type(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut cursor = 0;
+    skip_ows(bytes, &mut cursor);
+    let Some(media_type) = parse_token(bytes, &mut cursor) else {
+        return false;
+    };
+    if bytes.get(cursor) != Some(&b'/') {
+        return false;
+    }
+    cursor += 1;
+    let Some(media_subtype) = parse_token(bytes, &mut cursor) else {
+        return false;
+    };
+    if !media_type.eq_ignore_ascii_case(b"application")
+        || !media_subtype.eq_ignore_ascii_case(b"json")
+    {
+        return false;
+    }
+
+    loop {
+        skip_ows(bytes, &mut cursor);
+        if cursor == bytes.len() {
+            return true;
+        }
+        if bytes.get(cursor) != Some(&b';') {
+            return false;
+        }
+        cursor += 1;
+        skip_ows(bytes, &mut cursor);
+        if parse_token(bytes, &mut cursor).is_none() {
+            return false;
+        }
+        skip_ows(bytes, &mut cursor);
+        if bytes.get(cursor) != Some(&b'=') {
+            return false;
+        }
+        cursor += 1;
+        skip_ows(bytes, &mut cursor);
+        if bytes.get(cursor) == Some(&b'"') {
+            if !parse_quoted_string(bytes, &mut cursor) {
+                return false;
+            }
+        } else if parse_token(bytes, &mut cursor).is_none() {
+            return false;
+        }
+    }
+}
+
+fn skip_ows(bytes: &[u8], cursor: &mut usize) {
+    while matches!(bytes.get(*cursor), Some(b' ' | b'\t')) {
+        *cursor += 1;
+    }
+}
+
+fn parse_token<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let start = *cursor;
+    while bytes.get(*cursor).is_some_and(|byte| is_token_byte(*byte)) {
+        *cursor += 1;
+    }
+    (*cursor > start).then(|| &bytes[start..*cursor])
+}
+
+fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn parse_quoted_string(bytes: &[u8], cursor: &mut usize) -> bool {
+    *cursor += 1;
+    while let Some(&byte) = bytes.get(*cursor) {
+        *cursor += 1;
+        match byte {
+            b'"' => return true,
+            b'\\' => {
+                let Some(&escaped) = bytes.get(*cursor) else {
+                    return false;
+                };
+                if !matches!(escaped, b'\t' | b' '..=b'~') {
+                    return false;
+                }
+                *cursor += 1;
+            }
+            b'\t' | b' ' | b'!' | b'#'..=b'[' | b']'..=b'~' => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn body_rejection(rejection: BytesRejection) -> ApiResponse {
+    if rejection.into_response().status() == StatusCode::PAYLOAD_TOO_LARGE {
+        error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCategory::InvalidRequest,
+            "request body exceeds the configured limit",
+        )
+    } else {
+        invalid("request body could not be read")
+    }
+}
+
 fn price_scale(asset: AssetId) -> DecimalScale {
     DecimalScale::new(match asset {
         AssetId::BTC => 1,
@@ -599,6 +735,14 @@ fn ok(value: impl Serialize) -> ApiResponse {
 
 fn invalid(message: &'static str) -> ApiResponse {
     error(StatusCode::BAD_REQUEST, ErrorCategory::InvalidRequest, message)
+}
+
+fn unsupported_media_type() -> ApiResponse {
+    error(
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ErrorCategory::InvalidRequest,
+        "Content-Type must be application/json",
+    )
 }
 
 fn unauthorized() -> ApiResponse {
