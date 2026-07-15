@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/kfastov/hyperliquid-sim/protocol/v0.1/handoff.schema.json",
+  "title": "GPP pull request handoff",
+  "type": "object",
+  "required": ["task", "mode", "context_digest"],
+  "properties": {
+    "task": {"type": "integer", "minimum": 1},
+    "mode": {"enum": ["light", "strict"]},
+    "contract": {"type": "string"},
+    "context_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

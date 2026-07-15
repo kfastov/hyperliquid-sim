@@ -1,0 +1,6 @@
+/target/
+.gpp/context/
+.env
+*.log
+__pycache__/
+*.py[cod]

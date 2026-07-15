@@ -1,0 +1,49 @@
+name: Protocol task
+description: Define a unit of work for a human or coding agent
+title: "[Task]: "
+labels: ["task"]
+body:
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Task mode
+      options:
+        - strict
+        - light
+    validations:
+      required: true
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: One observable outcome, not an implementation recipe.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance
+      description: Observable assertions and commands that prove the outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: Allowed area, forbidden area, and explicit non-goals.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Issue numbers or "none".
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and open decisions
+      description: Unknowns that could invalidate the task.
+    validations:
+      required: true

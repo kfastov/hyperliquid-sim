@@ -1,0 +1,6 @@
+# Protocol and CI are policy surfaces and require explicit owner review.
+/.github/ @kfastov
+/protocol/ @kfastov
+/tools/gpp.py @kfastov
+/AGENTS.md @kfastov
+/CODEOWNERS @kfastov

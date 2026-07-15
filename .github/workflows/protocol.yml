@@ -1,0 +1,26 @@
+name: protocol
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Validate repository contracts
+        run: python3 tools/gpp.py validate-repo
+      - name: Validate pull request binding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/gpp.py validate-pr --event "$GITHUB_EVENT_PATH"
