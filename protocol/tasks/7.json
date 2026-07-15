@@ -1,0 +1,65 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 7,
+  "objective": "Audit GPP v0.1 against durable evidence from the completed multi-agent simulator experiment, classify every observed protocol failure or ambiguity, and harden protocol code, tests, workflow enforcement, and documentation with deterministic regressions while separating enforced invariants from conventions and pilot-specific limitations.",
+  "scope": {
+    "write": [
+      "protocol/v0.1/**",
+      "tools/gpp.py",
+      "tests/test_gpp.py",
+      ".github/workflows/protocol.yml",
+      "docs/protocol/**",
+      "AGENTS.md"
+    ],
+    "forbidden": [
+      "protocol/tasks/**",
+      ".github/workflows/ci.yml",
+      "CODEOWNERS",
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/**",
+      "acceptance/**",
+      "deploy/**",
+      "Dockerfile"
+    ]
+  },
+  "inputs": [
+    "AGENTS.md",
+    "protocol/v0.1/README.md",
+    "protocol/v0.1/task.schema.json",
+    "protocol/v0.1/handoff.schema.json",
+    "tools/gpp.py",
+    "tests/test_gpp.py",
+    ".github/workflows/protocol.yml",
+    "docs/architecture.md",
+    "docs/compatibility.md"
+  ],
+  "dependencies": [6],
+  "acceptance": {
+    "commands": [
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo",
+      "python3 -m py_compile tools/gpp.py",
+      "git diff --check"
+    ],
+    "assertions": [
+      "A published evidence ledger gives every observed experiment failure or ambiguity a durable source, impact, disposition, and deterministic regression check where one is possible.",
+      "The final protocol specification explicitly distinguishes mechanically enforced invariants, GitHub/branch-protection enforcement, worker conventions, and known limitations.",
+      "Protocol/schema/validator/workflow changes remain mutually consistent and tests cover stale or forged metadata, duplicate canonical PRs, immutable base contracts, dependency acceptance, scope enforcement, and any newly fixed failure.",
+      "No strict task contract or simulator product, acceptance, deployment, container, or CI behavior is changed by this hardening task.",
+      "Pilot-specific ceremony is not promoted to a universal requirement without evidence and a stated portability rationale."
+    ]
+  },
+  "deliverables": [
+    "Experiment evidence ledger and final protocol conformance report under docs/protocol",
+    "Consistent GPP specification/schema/validator updates justified by observed evidence",
+    "Deterministic protocol regression tests and narrowly scoped protocol workflow updates",
+    "Updated agent bootstrap guidance where enforcement or recovery behavior changed"
+  ],
+  "risks": [
+    "A single pilot can encourage overfitting incidental workflow into protocol requirements.",
+    "Documentation, JSON schemas, Python validation, and GitHub workflow behavior can drift apart.",
+    "Claims of enforcement can exceed what repository permissions or branch protection actually guarantee."
+  ],
+  "notes": "Product-code repair is deliberately excluded. If the audit discovers a product blocker, record it and open a separately scoped task rather than modifying simulator behavior inside protocol hardening."
+}

@@ -1,0 +1,77 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 6,
+  "objective": "Integrate the accepted core, HTTP, WebSocket, oracle, and actor components into one runnable bounded service; add black-box acceptance probes, packaging, deployment assets, and operator/user documentation for a clearly labeled public synthetic demo.",
+  "scope": {
+    "write": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/sim-server/Cargo.toml",
+      "crates/sim-server/src/main.rs",
+      "crates/sim-server/src/config.rs",
+      "crates/sim-server/tests/integration/**",
+      "acceptance/**",
+      "deploy/**",
+      "Dockerfile",
+      ".dockerignore",
+      "docs/deployment.md",
+      "docs/operations.md",
+      "docs/quickstart.md",
+      "README.md"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "tools/gpp.py",
+      "AGENTS.md",
+      "crates/sim-core/**",
+      "crates/hl-wire/**",
+      "crates/oracle-hyperliquid/src/**",
+      "crates/sim-server/src/http/**",
+      "crates/sim-server/src/ws/**",
+      "crates/sim-server/src/runtime/**",
+      "docs/architecture.md",
+      "docs/compatibility.md"
+    ]
+  },
+  "inputs": [
+    "docs/architecture.md",
+    "docs/compatibility.md",
+    "Cargo.toml",
+    "crates/sim-server/src/lib.rs",
+    "crates/sim-server/src/http/mod.rs",
+    "crates/sim-server/src/ws/mod.rs",
+    "crates/sim-server/src/runtime/mod.rs"
+  ],
+  "dependencies": [3, 4, 5],
+  "acceptance": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo test --workspace",
+      "docker build -t hyperliquid-sim:acceptance .",
+      "python3 acceptance/probe.py --base-url http://127.0.0.1:8080 --ws-url ws://127.0.0.1:8080/ws",
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo"
+    ],
+    "assertions": [
+      "A fresh checkout builds one runnable service, its liveness and readiness are distinguishable, and graceful shutdown terminates listeners, actors, oracle work, and the engine owner.",
+      "The black-box probe obtains metadata/mids/book data, subscribes to quotes and trades, creates a local order, observes its user update, and cancels an open order using X-Sim-User.",
+      "A stale-oracle probe shows placement rejection after greater than 60 seconds while cancellation remains available, and a safety probe observes no upstream state-changing requests.",
+      "The container/deployment applies bounded request bodies, order batches, command queues, WebSocket connections/buffers, and public rate limits without changing the frozen compatibility profile.",
+      "Deployment, operations, quickstart, and README material clearly label synthetic state and document sim-header-v1, fixed assets, seed/configuration, health, oracle fallback, unsupported behavior, and no-real-funds/no-upstream-trading boundaries."
+    ]
+  },
+  "deliverables": [
+    "sim-server executable composition and validated configuration",
+    "Black-box HTTP/WebSocket/staleness/safety acceptance probes",
+    "Container and deployment/service assets for the public demo",
+    "Deployment, operations, quickstart, and top-level user documentation"
+  ],
+  "risks": [
+    "Public endpoint abuse can exhaust connections, queues, or memory.",
+    "TLS, firewall, process supervision, or upstream availability can make a local success non-reproducible externally.",
+    "Integration pressure can silently broaden compatibility or bypass accepted module interfaces."
+  ],
+  "notes": "Shared manifest edits are unavoidable during final composition; product module directories remain forbidden so integration failures are repaired in their owning tasks rather than patched around here."
+}

@@ -1,0 +1,65 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 5,
+  "objective": "Implement a read-only live Hyperliquid oracle, the single-owner simulator runtime, and seeded local actors for BTC, ETH, and SOL, with activeAssetCtx oraclePx as primary input, metaAndAssetCtxs fallback, deterministic actor behavior, and a 60-second stale-order safety gate.",
+  "scope": {
+    "write": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/oracle-hyperliquid/**",
+      "crates/sim-server/Cargo.toml",
+      "crates/sim-server/src/runtime/**",
+      "crates/sim-server/tests/runtime/**"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "tools/gpp.py",
+      "AGENTS.md",
+      "docs/**",
+      "crates/sim-core/**",
+      "crates/sim-server/src/http/**",
+      "crates/sim-server/src/ws/**",
+      "deploy/**"
+    ]
+  },
+  "inputs": [
+    "docs/architecture.md",
+    "docs/compatibility.md",
+    "Cargo.toml",
+    "crates/hl-wire/src/lib.rs",
+    "crates/sim-core/src/lib.rs",
+    "crates/sim-server/Cargo.toml",
+    "crates/sim-server/src/lib.rs"
+  ],
+  "dependencies": [2],
+  "acceptance": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy -p oracle-hyperliquid -p sim-server --all-targets -- -D warnings",
+      "cargo test -p oracle-hyperliquid",
+      "cargo test -p sim-server --test runtime",
+      "cargo test --workspace",
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo"
+    ],
+    "assertions": [
+      "The oracle maps only BTC, ETH, and SOL, consumes activeAssetCtx.oraclePx as primary data, falls back to read-only metaAndAssetCtxs, and rejects malformed, non-positive, unmapped, or out-of-order observations without cross-contaminating assets.",
+      "At observation age greater than 60 seconds, new user and actor orders for the affected asset are rejected with oracle_stale while cancel and state queries remain available.",
+      "The runtime has one engine owner, bounded command/event channels, explicit logical time, and no adapter or actor direct-mutation path.",
+      "Given identical seeds, clock steps, and oracle observations, actor commands and resulting core event streams are identical; different asset books remain independent.",
+      "A test double proves the upstream surface is read-only and that disconnection/reconnect cannot invoke order, cancel, transfer, wallet, or any other state-changing Hyperliquid method."
+    ]
+  },
+  "deliverables": [
+    "oracle-hyperliquid read-only client, normalization, health, fallback, and reconnection tests",
+    "Single-owner runtime, fake clock, freshness gate, and bounded fan-out plumbing",
+    "Seeded synthetic liquidity/trade actors and deterministic tests"
+  ],
+  "risks": [
+    "Upstream schema drift or symbol ordering can map a price to the wrong local asset.",
+    "Wall-clock or unseeded randomness can make actor and event behavior irreproducible.",
+    "An overly broad upstream client can violate the no-real-trading safety boundary."
+  ],
+  "notes": "Manifest edits are the only intentional write-scope overlap with task #2 and are limited to adding the oracle/runtime dependencies that cannot compile before the oracle crate exists."
+}

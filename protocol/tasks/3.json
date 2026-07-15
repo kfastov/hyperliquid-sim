@@ -1,0 +1,57 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 3,
+  "objective": "Implement the sim-header-v1 HTTP adapter for the supported Hyperliquid-shaped /info and /exchange subset using the shared simulator interfaces, with explicit local identity, bounded batches, stable errors, and no direct domain mutation.",
+  "scope": {
+    "write": [
+      "crates/sim-server/src/http/**",
+      "crates/sim-server/tests/http/**"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "tools/gpp.py",
+      "AGENTS.md",
+      "docs/**",
+      "crates/sim-core/**",
+      "crates/oracle-hyperliquid/**",
+      "crates/sim-server/src/ws/**",
+      "crates/sim-server/src/runtime/**"
+    ]
+  },
+  "inputs": [
+    "docs/architecture.md",
+    "docs/compatibility.md",
+    "crates/hl-wire/src/lib.rs",
+    "crates/sim-core/src/lib.rs",
+    "crates/sim-server/src/lib.rs"
+  ],
+  "dependencies": [2],
+  "acceptance": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy -p sim-server --all-targets -- -D warnings",
+      "cargo test -p sim-server --test http",
+      "cargo test --workspace",
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo"
+    ],
+    "assertions": [
+      "SDK-shaped fixtures and external-style HTTP tests cover /info types meta, metaAndAssetCtxs, allMids, l2Book, openOrders, and clearinghouseState for only BTC, ETH, and SOL.",
+      "/exchange tests cover bounded batch limit-order placement for GTC, IOC, and ALO plus cancel, preserving request-order per-entry statuses and partial success.",
+      "User-scoped calls require normalized X-Sim-User under sim-header-v1; signature-shaped fields are syntax-checked but never trusted to authenticate or select a user.",
+      "Malformed JSON, unsupported behavior, missing identity, stale oracle, overload, and domain rejection are observably distinct and no handler mutates engine state outside the command interface.",
+      "No request is forwarded to Hyperliquid and no WebSocket or oracle behavior is implemented."
+    ]
+  },
+  "deliverables": [
+    "HTTP routes and request/response translation under crates/sim-server/src/http",
+    "HTTP adapter fixtures and integration tests under crates/sim-server/tests/http"
+  ],
+  "risks": [
+    "Hyperliquid SDK payloads can imply signature-derived identity that this local profile intentionally does not provide.",
+    "Adapters can accidentally return plausible fields whose semantics are outside the documented compatibility subset.",
+    "Unbounded bodies or batches can exhaust a public demo service."
+  ],
+  "notes": "The task relies on task #2 to pre-establish sim-server dependencies and module exports; it must not edit shared manifests or sibling adapter/runtime directories."
+}

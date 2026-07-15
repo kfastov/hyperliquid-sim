@@ -1,0 +1,61 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 2,
+  "objective": "Create the Rust workspace and shared interfaces, then implement a deterministic single-owner perpetual exchange core for fixed assets BTC=0, ETH=1, and SOL=2 with integer ticks/lots, local accounts, price-time matching, GTC/IOC/ALO placement, cancellation, fills, snapshots, and ordered events.",
+  "scope": {
+    "write": [
+      "Cargo.toml",
+      "Cargo.lock",
+      "rustfmt.toml",
+      "crates/hl-wire/**",
+      "crates/sim-core/**",
+      "crates/sim-server/Cargo.toml",
+      "crates/sim-server/src/lib.rs",
+      "crates/sim-server/src/http/mod.rs",
+      "crates/sim-server/src/ws/mod.rs",
+      "crates/sim-server/src/runtime/mod.rs"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "tools/gpp.py",
+      "AGENTS.md",
+      "docs/**",
+      "deploy/**"
+    ]
+  },
+  "inputs": [
+    "docs/architecture.md",
+    "docs/compatibility.md"
+  ],
+  "dependencies": [],
+  "acceptance": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo test -p hl-wire -p sim-core",
+      "cargo test --workspace",
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo"
+    ],
+    "assertions": [
+      "The workspace contains compiling hl-wire and sim-core crates plus a compiling sim-server shell whose public command, snapshot, event, and adapter seams let tasks #3, #4, and #5 work without changing core internals.",
+      "BTC, ETH, and SOL have fixed IDs 0, 1, and 2, and matching/account state uses exact integer ticks and lots with checked conversion and no floating-point arithmetic.",
+      "Deterministic tests cover resting and crossing orders, price-time priority, partial fills, GTC, IOC remainder cancellation, marketable ALO rejection, owner-scoped cancel, terminal/unknown cancel errors, and independent books.",
+      "Replaying the same commands, logical timestamps, and seed produces identical IDs, results, snapshots, and ordered events.",
+      "The core reads no wall clock or system entropy and exposes no HTTP, WebSocket, oracle network, real-funds, signature-recovery, liquidation, funding, leverage, or upstream-trading behavior."
+    ]
+  },
+  "deliverables": [
+    "Rust workspace manifests and lockfile",
+    "hl-wire validated value types and shared DTO/interface types",
+    "sim-core deterministic engine, books, accounts, commands, snapshots, events, and tests",
+    "Compiling sim-server shell with isolated HTTP, WebSocket, and runtime module seams"
+  ],
+  "risks": [
+    "Shared interfaces can accidentally encode adapter-specific behavior and force downstream merge conflicts.",
+    "Decimal conversion, overflow, or event-order ambiguity can break determinism.",
+    "A broad workspace scaffold can drift into forbidden network or product integration work."
+  ],
+  "notes": "Task #2 intentionally has no strict dependency. Planning Issue #1 is delivered by the same PR that introduces this contract and must not become an implementation-contract dependency. The sim-server files in scope are interface-only scaffolding required for parallel downstream adapters, not server implementation."
+}
