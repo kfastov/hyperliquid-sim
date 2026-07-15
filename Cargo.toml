@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/hl-wire",
+    "crates/oracle-hyperliquid",
     "crates/sim-core",
     "crates/sim-server",
 ]
@@ -15,12 +16,14 @@ license = "MIT"
 axum = { version = "0.8", features = ["json", "ws"] }
 futures-util = "0.3"
 hl-wire = { path = "crates/hl-wire" }
+oracle-hyperliquid = { path = "crates/oracle-hyperliquid" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 http-body-util = "0.1"
 serde_json = "1"
 sim-core = { path = "crates/sim-core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util", "limit", "buffer"] }
 tower-http = { version = "0.6", features = ["limit", "trace", "cors", "timeout"] }

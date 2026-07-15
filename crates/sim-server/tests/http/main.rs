@@ -134,6 +134,12 @@ fn runtime() -> Arc<dyn RuntimePort> {
                 RuntimeRequest::EventsAfter(sequence) => {
                     RuntimeReply::Events(engine.events_after(*sequence))
                 }
+                RuntimeRequest::ObserveOracle(_) => {
+                    panic!("HTTP adapter did not submit an oracle observation")
+                }
+                RuntimeRequest::OracleHealth => {
+                    panic!("HTTP adapter did not request oracle health")
+                }
                 RuntimeRequest::Shutdown => RuntimeReply::Shutdown,
             };
             let _ = envelope.respond(Ok(reply));
@@ -429,6 +435,62 @@ async fn stale_oracle_blocks_placement_but_not_cancel() {
         post(app, "/exchange", cancel, Some(ALICE)).await.1["error"]["category"],
         "oracle_stale"
     );
+}
+
+#[tokio::test]
+async fn runtime_stale_race_names_asset_without_blocking_cancel_or_query() {
+    let limits = RuntimeLimits::new(NonZeroUsize::new(4).unwrap(), NonZeroUsize::MIN);
+    let (port, mut owner, _) = bounded_runtime(limits);
+    tokio::spawn(async move {
+        let mut engine = Engine::new(7);
+        while let Some(envelope) = owner.recv().await {
+            let reply = match &envelope.request {
+                RuntimeRequest::Apply(sim_core::Command::PlaceBatch { .. }) => {
+                    Err(RuntimeError::OracleStale(AssetId::ETH))
+                }
+                RuntimeRequest::Apply(command @ sim_core::Command::CancelBatch { .. }) => {
+                    Ok(RuntimeReply::Applied(engine.apply(command.clone())))
+                }
+                RuntimeRequest::Book(asset) => Ok(RuntimeReply::Book(engine.book_snapshot(*asset))),
+                RuntimeRequest::EngineSnapshot => {
+                    Ok(RuntimeReply::EngineSnapshot(engine.snapshot()))
+                }
+                RuntimeRequest::Account(user) => {
+                    Ok(RuntimeReply::Account(engine.account_snapshot(user)))
+                }
+                RuntimeRequest::Order(id) => Ok(RuntimeReply::Order(engine.order(*id))),
+                RuntimeRequest::EventsAfter(sequence) => {
+                    Ok(RuntimeReply::Events(engine.events_after(*sequence)))
+                }
+                RuntimeRequest::ObserveOracle(_) => {
+                    panic!("HTTP adapter did not submit an oracle observation")
+                }
+                RuntimeRequest::OracleHealth => {
+                    panic!("HTTP adapter did not request oracle health")
+                }
+                RuntimeRequest::Shutdown => Ok(RuntimeReply::Shutdown),
+            };
+            envelope.respond(reply).expect("HTTP handler receives fake reply");
+        }
+    });
+    let app = app(Arc::new(FakeRuntimePort(port)), market(None), 8);
+
+    let placement = exchange(
+        json!({"type":"order","orders":[order(0,true,"60000.1","0.00001","Gtc")],"grouping":"na"}),
+    );
+    let (status, body) = post(app.clone(), "/exchange", placement, Some(ALICE)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["category"], "oracle_stale");
+    assert_eq!(body["error"]["message"], "oracle observation is stale for ETH");
+
+    let cancel = exchange(json!({"type":"cancel","cancels":[{"a":0,"o":1}]}));
+    let (status, body) = post(app.clone(), "/exchange", cancel, Some(ALICE)).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_ne!(body["response"]["data"]["statuses"][0]["error"]["category"], "oracle_stale");
+
+    let (status, body) = post(app, "/info", json!({"type":"l2Book","coin":"BTC"}), None).await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["coin"], "BTC");
 }
 
 #[tokio::test]

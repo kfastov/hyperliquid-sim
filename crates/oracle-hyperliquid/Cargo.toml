@@ -1,22 +1,19 @@
 [package]
-name = "sim-server"
+name = "oracle-hyperliquid"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-axum.workspace = true
 futures-util.workspace = true
 hl-wire.workspace = true
-oracle-hyperliquid.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sim-core.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-tower.workspace = true
-tower-http.workspace = true
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
-http-body-util.workspace = true
-tokio-tungstenite.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

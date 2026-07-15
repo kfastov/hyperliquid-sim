@@ -1,14 +1,17 @@
-//! Typed, bounded boundary around the future single-owner engine runtime.
+//! Typed, bounded boundary around the single-owner engine runtime.
 //!
-//! This module deliberately defines channels and messages only. Task #5 owns
-//! the loop that receives [`RuntimeEnvelope`] values and mutates the engine.
+//! Every adapter and local actor reaches the engine through [`RuntimePort`].
+
+pub mod actors;
 
 use hl_wire::{AssetId, SimUserId};
+pub use oracle_hyperliquid::{Clock, ObservationSource, OracleFreshness, SystemClock};
+use oracle_hyperliquid::{ObservationReject, OracleObservation, OracleState};
 use sim_core::{
-    AccountSnapshot, ApplyResult, BookSnapshot, Command, EngineSnapshot, EventRecord,
+    AccountSnapshot, ApplyResult, BookSnapshot, Command, Engine, EngineSnapshot, EventRecord,
     EventSequence, OrderId, OrderSnapshot,
 };
-use std::{error::Error, fmt, num::NonZeroUsize};
+use std::{error::Error, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Capacity limits for the runtime command queue and event fan-out.
@@ -28,6 +31,8 @@ impl RuntimeLimits {
 /// Commands and read-only queries accepted by the engine owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeRequest {
+    ObserveOracle(OracleObservation),
+    OracleHealth,
     Apply(Command),
     EngineSnapshot,
     Book(AssetId),
@@ -40,6 +45,8 @@ pub enum RuntimeRequest {
 /// Typed responses corresponding to [`RuntimeRequest`] variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeReply {
+    OracleObserved(Result<(), ObservationReject>),
+    OracleHealth(RuntimeOracleHealth),
     Applied(ApplyResult),
     EngineSnapshot(EngineSnapshot),
     Book(BookSnapshot),
@@ -47,6 +54,27 @@ pub enum RuntimeReply {
     Order(Option<OrderSnapshot>),
     Events(Vec<EventRecord>),
     Shutdown,
+}
+
+/// Freshness state for one supported oracle asset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OracleAssetHealth {
+    Missing {
+        asset: AssetId,
+    },
+    Observed {
+        asset: AssetId,
+        source: ObservationSource,
+        upstream_sequence: u64,
+        observed_at_ms: u64,
+        freshness: OracleFreshness,
+    },
+}
+
+/// Complete BTC/ETH/SOL oracle health computed from one runtime-clock reading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeOracleHealth {
+    pub assets: [OracleAssetHealth; 3],
 }
 
 /// Failures at the bounded runtime boundary.
@@ -58,15 +86,18 @@ pub enum RuntimeError {
     ShuttingDown,
     /// The requester stopped waiting before the owner delivered its reply.
     ReplyDropped,
+    /// At least one placement asset has no current oracle observation.
+    OracleStale(AssetId),
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Overloaded => "runtime request queue is full",
-            Self::ShuttingDown => "runtime is shutting down",
-            Self::ReplyDropped => "runtime reply receiver was dropped",
-        })
+        match self {
+            Self::Overloaded => formatter.write_str("runtime request queue is full"),
+            Self::ShuttingDown => formatter.write_str("runtime is shutting down"),
+            Self::ReplyDropped => formatter.write_str("runtime reply receiver was dropped"),
+            Self::OracleStale(asset) => write!(formatter, "oracle_stale for {}", asset.symbol()),
+        }
     }
 }
 
@@ -164,6 +195,148 @@ pub fn bounded_runtime(
     let (requests, receiver) = mpsc::channel(limits.request_capacity.get());
     let (events, _) = broadcast::channel(limits.event_capacity.get());
     (RuntimeHandle { requests, events: events.clone() }, receiver, RuntimeEventPublisher { events })
+}
+
+/// Completion handle for the exclusively owned engine task.
+#[derive(Debug)]
+pub struct RuntimeTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeTaskError {
+    TimedOut,
+    OwnerFailed,
+}
+
+impl fmt::Display for RuntimeTaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TimedOut => "runtime did not stop within the graceful shutdown bound",
+            Self::OwnerFailed => "runtime owner task failed",
+        })
+    }
+}
+
+impl Error for RuntimeTaskError {}
+
+impl RuntimeTask {
+    /// Waits for graceful completion, aborting the owner if the bound expires.
+    pub async fn wait(mut self, bound: Duration) -> Result<(), RuntimeTaskError> {
+        match tokio::time::timeout(bound, &mut self.task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RuntimeTaskError::OwnerFailed),
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Err(RuntimeTaskError::TimedOut)
+            }
+        }
+    }
+}
+
+/// Starts the only task that owns and mutates the deterministic engine.
+#[must_use]
+pub fn start_runtime(seed: u64, limits: RuntimeLimits) -> (RuntimeHandle, RuntimeTask) {
+    start_runtime_with_clock(seed, limits, Arc::new(SystemClock))
+}
+
+/// Starts the owner with an injected object-safe clock for deterministic composition.
+#[must_use]
+pub fn start_runtime_with_clock(
+    seed: u64,
+    limits: RuntimeLimits,
+    clock: Arc<dyn Clock>,
+) -> (RuntimeHandle, RuntimeTask) {
+    let (handle, receiver, publisher) = bounded_runtime(limits);
+    let task = tokio::spawn(run_owner(Engine::new(seed), receiver, publisher, clock));
+    (handle, RuntimeTask { task })
+}
+
+async fn run_owner(
+    mut engine: Engine,
+    mut requests: mpsc::Receiver<RuntimeEnvelope>,
+    publisher: RuntimeEventPublisher,
+    clock: Arc<dyn Clock>,
+) {
+    let mut oracle = OracleState::default();
+    let mut last_sequence = None;
+    publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::Initializing));
+
+    while let Some(envelope) = requests.recv().await {
+        let shutdown = matches!(envelope.request, RuntimeRequest::Shutdown);
+        let reply = match &envelope.request {
+            RuntimeRequest::ObserveOracle(observation) => {
+                Ok(RuntimeReply::OracleObserved(oracle.observe(*observation)))
+            }
+            RuntimeRequest::OracleHealth => {
+                Ok(RuntimeReply::OracleHealth(oracle_health(&oracle, clock.now_ms())))
+            }
+            RuntimeRequest::Apply(command) => {
+                if let Some(asset) = stale_placement_asset(command, &oracle, clock.now_ms()) {
+                    Err(RuntimeError::OracleStale(asset))
+                } else {
+                    let result = engine.apply(command.clone());
+                    for record in &result.events {
+                        last_sequence = Some(record.sequence);
+                        publisher.publish(RuntimeEvent::Event {
+                            record: record.clone(),
+                            freshness: RuntimeFreshness::Current { sequence: record.sequence },
+                        });
+                    }
+                    Ok(RuntimeReply::Applied(result))
+                }
+            }
+            RuntimeRequest::EngineSnapshot => Ok(RuntimeReply::EngineSnapshot(engine.snapshot())),
+            RuntimeRequest::Book(asset) => Ok(RuntimeReply::Book(engine.book_snapshot(*asset))),
+            RuntimeRequest::Account(user) => {
+                Ok(RuntimeReply::Account(engine.account_snapshot(user)))
+            }
+            RuntimeRequest::Order(order_id) => Ok(RuntimeReply::Order(engine.order(*order_id))),
+            RuntimeRequest::EventsAfter(sequence) => {
+                Ok(RuntimeReply::Events(engine.events_after(*sequence)))
+            }
+            RuntimeRequest::Shutdown => Ok(RuntimeReply::Shutdown),
+        };
+        let _ = envelope.respond(reply);
+
+        if shutdown {
+            requests.close();
+            publisher
+                .publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
+            while let Some(queued) = requests.recv().await {
+                let _ = queued.respond(Err(RuntimeError::ShuttingDown));
+            }
+            return;
+        }
+    }
+
+    publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
+}
+
+fn stale_placement_asset(command: &Command, oracle: &OracleState, now_ms: u64) -> Option<AssetId> {
+    let Command::PlaceBatch { orders, .. } = command else {
+        return None;
+    };
+    orders
+        .iter()
+        .map(|order| order.asset)
+        .find(|asset| !matches!(oracle.freshness(*asset, now_ms), OracleFreshness::Fresh { .. }))
+}
+
+fn oracle_health(oracle: &OracleState, now_ms: u64) -> RuntimeOracleHealth {
+    RuntimeOracleHealth {
+        assets: AssetId::ALL.map(|asset| match oracle.observation(asset) {
+            Some(observation) => OracleAssetHealth::Observed {
+                asset,
+                source: observation.source,
+                upstream_sequence: observation.upstream_sequence,
+                observed_at_ms: observation.observed_at_ms,
+                freshness: oracle.freshness(asset, now_ms),
+            },
+            None => OracleAssetHealth::Missing { asset },
+        }),
+    }
 }
 
 #[cfg(test)]
