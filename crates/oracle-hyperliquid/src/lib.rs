@@ -4,6 +4,7 @@
 //! This crate contains no wallet, signing, exchange, order, cancel, or transfer
 //! capability.
 
+use futures_util::{SinkExt, StreamExt};
 use hl_wire::{AssetId, DecimalScale, PriceTicks, WireValueError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,8 +16,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use tokio::{net::TcpStream, time::Instant};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 pub const STALE_AFTER_MS: u64 = 60_000;
+pub const MAINNET_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
+pub const MAINNET_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 
 /// Boxed future used by the object-safe read-only upstream boundary.
 pub type UpstreamFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -230,6 +235,281 @@ struct ActiveAssetCtx {
     oracle_px: String,
 }
 
+/// Injectable endpoints and operation bounds for the public read-only transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveConfig {
+    pub ws_url: String,
+    pub info_url: String,
+    pub connect_timeout: Duration,
+    pub write_timeout: Duration,
+    pub read_timeout: Duration,
+    pub send_timeout: Duration,
+    pub heartbeat_interval: Duration,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            ws_url: MAINNET_WS_URL.to_owned(),
+            info_url: MAINNET_INFO_URL.to_owned(),
+            connect_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(5),
+            read_timeout: Duration::from_secs(40),
+            send_timeout: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_secs(30),
+        }
+    }
+}
+
+impl LiveConfig {
+    fn bounded(mut self) -> Self {
+        self.connect_timeout = self.connect_timeout.max(Duration::from_millis(1));
+        self.write_timeout = self.write_timeout.max(Duration::from_millis(1));
+        self.read_timeout = self.read_timeout.max(Duration::from_millis(1));
+        self.send_timeout = self.send_timeout.max(Duration::from_millis(1));
+        self.heartbeat_interval =
+            self.heartbeat_interval.clamp(Duration::from_millis(1), Duration::from_secs(50));
+        self
+    }
+}
+
+/// Typed failures that require a fresh WebSocket connection and resubscription.
+#[derive(Debug, Error)]
+pub enum LiveTransportError {
+    #[error("websocket connect timed out")]
+    ConnectTimeout,
+    #[error("websocket subscription write timed out")]
+    WriteTimeout,
+    #[error("websocket read timed out")]
+    ReadTimeout,
+    #[error("websocket control send timed out")]
+    SendTimeout,
+    #[error("websocket is not connected")]
+    NotConnected,
+    #[error("websocket disconnected")]
+    Disconnected,
+    #[error("websocket transport failed: {0}")]
+    WebSocket(#[source] tokio_tungstenite::tungstenite::Error),
+    #[error("HTTP fallback failed: {0}")]
+    Http(#[source] reqwest::Error),
+    #[error(transparent)]
+    Parse(#[from] OracleParseError),
+}
+
+impl LiveTransportError {
+    /// Whether the primary stream must be recreated before another WS read.
+    #[must_use]
+    pub const fn is_reconnectable(&self) -> bool {
+        matches!(
+            self,
+            Self::ConnectTimeout
+                | Self::WriteTimeout
+                | Self::ReadTimeout
+                | Self::SendTimeout
+                | Self::NotConnected
+                | Self::Disconnected
+                | Self::WebSocket(_)
+        )
+    }
+}
+
+/// The complete live upstream capability: fixed public connect/read/fallback only.
+/// No arbitrary request, wallet, signing, order, cancel, or transfer operation is exposed.
+pub trait OracleTransport: Send {
+    type Error: Error + Send + Sync + 'static;
+
+    fn connect(&mut self) -> UpstreamFuture<'_, (), Self::Error>;
+    fn next_active_asset_ctx(
+        &mut self,
+        upstream_sequence: u64,
+        scales: PriceScales,
+    ) -> UpstreamFuture<'_, OracleObservation, Self::Error>;
+    fn meta_and_asset_ctxs(
+        &mut self,
+        upstream_sequence: u64,
+        scales: PriceScales,
+    ) -> UpstreamFuture<'_, Vec<OracleObservation>, Self::Error>;
+}
+
+type LiveSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Tokio implementation of the capability-safe public market-data transport.
+pub struct TokioHyperliquidTransport<C> {
+    config: LiveConfig,
+    clock: C,
+    info: HyperliquidInfoClient,
+    socket: Option<LiveSocket>,
+    last_heartbeat: Instant,
+}
+
+impl<C: Clock> TokioHyperliquidTransport<C> {
+    #[must_use]
+    pub fn new(config: LiveConfig, clock: C) -> Self {
+        let config = config.bounded();
+        Self {
+            info: HyperliquidInfoClient::new(config.info_url.clone()),
+            config,
+            clock,
+            socket: None,
+            last_heartbeat: Instant::now(),
+        }
+    }
+
+    async fn send_control(
+        socket: &mut LiveSocket,
+        message: Message,
+        timeout: Duration,
+    ) -> Result<(), LiveTransportError> {
+        tokio::time::timeout(timeout, socket.send(message))
+            .await
+            .map_err(|_| LiveTransportError::SendTimeout)?
+            .map_err(LiveTransportError::WebSocket)
+    }
+
+    fn disconnect(&mut self) {
+        self.socket = None;
+    }
+}
+
+impl<C: Clock> OracleTransport for TokioHyperliquidTransport<C> {
+    type Error = LiveTransportError;
+
+    fn connect(&mut self) -> UpstreamFuture<'_, (), Self::Error> {
+        Box::pin(async move {
+            self.disconnect();
+            let (mut socket, _) = tokio::time::timeout(
+                self.config.connect_timeout,
+                tokio_tungstenite::connect_async(&self.config.ws_url),
+            )
+            .await
+            .map_err(|_| LiveTransportError::ConnectTimeout)?
+            .map_err(LiveTransportError::WebSocket)?;
+
+            for asset in AssetId::ALL {
+                let payload = serde_json::to_string(&ActiveAssetCtxSubscription::for_asset(asset))
+                    .expect("fixed subscription DTO is serializable");
+                tokio::time::timeout(
+                    self.config.write_timeout,
+                    socket.send(Message::Text(payload.into())),
+                )
+                .await
+                .map_err(|_| LiveTransportError::WriteTimeout)?
+                .map_err(LiveTransportError::WebSocket)?;
+            }
+            self.last_heartbeat = Instant::now();
+            self.socket = Some(socket);
+            Ok(())
+        })
+    }
+
+    fn next_active_asset_ctx(
+        &mut self,
+        upstream_sequence: u64,
+        scales: PriceScales,
+    ) -> UpstreamFuture<'_, OracleObservation, Self::Error> {
+        Box::pin(async move {
+            let read_deadline = Instant::now() + self.config.read_timeout;
+            loop {
+                let heartbeat_deadline = self.last_heartbeat + self.config.heartbeat_interval;
+                let deadline = read_deadline.min(heartbeat_deadline);
+                let frame = {
+                    let socket = self.socket.as_mut().ok_or(LiveTransportError::NotConnected)?;
+                    tokio::time::timeout_at(deadline, socket.next()).await
+                };
+                let frame = match frame {
+                    Err(_) if Instant::now() >= read_deadline => {
+                        self.disconnect();
+                        return Err(LiveTransportError::ReadTimeout);
+                    }
+                    Err(_) => {
+                        let socket =
+                            self.socket.as_mut().ok_or(LiveTransportError::NotConnected)?;
+                        if let Err(error) = Self::send_control(
+                            socket,
+                            Message::Text(json!({"method":"ping"}).to_string().into()),
+                            self.config.send_timeout,
+                        )
+                        .await
+                        {
+                            self.disconnect();
+                            return Err(error);
+                        }
+                        self.last_heartbeat = Instant::now();
+                        continue;
+                    }
+                    Ok(None) => {
+                        self.disconnect();
+                        return Err(LiveTransportError::Disconnected);
+                    }
+                    Ok(Some(Err(error))) => {
+                        self.disconnect();
+                        return Err(LiveTransportError::WebSocket(error));
+                    }
+                    Ok(Some(Ok(frame))) => frame,
+                };
+
+                match frame {
+                    Message::Close(_) => {
+                        self.disconnect();
+                        return Err(LiveTransportError::Disconnected);
+                    }
+                    Message::Ping(payload) => {
+                        let socket =
+                            self.socket.as_mut().ok_or(LiveTransportError::NotConnected)?;
+                        if let Err(error) = Self::send_control(
+                            socket,
+                            Message::Pong(payload),
+                            self.config.send_timeout,
+                        )
+                        .await
+                        {
+                            self.disconnect();
+                            return Err(error);
+                        }
+                    }
+                    Message::Text(text) => {
+                        let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        match parse_ws_inbound(&payload) {
+                            Ok(WsInbound::ActiveAssetCtx { .. }) => {
+                                // The payload has arrived and passed strict channel/asset parsing
+                                // before the injected receive clock is sampled.
+                                let observed_at_ms = self.clock.now_ms();
+                                return parse_active_asset_ctx(
+                                    &payload,
+                                    observed_at_ms,
+                                    upstream_sequence,
+                                    scales,
+                                )
+                                .map_err(LiveTransportError::Parse);
+                            }
+                            Ok(WsInbound::SubscriptionAcknowledged(_) | WsInbound::Pong)
+                            | Err(_) => continue,
+                        }
+                    }
+                    Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                }
+            }
+        })
+    }
+
+    fn meta_and_asset_ctxs(
+        &mut self,
+        upstream_sequence: u64,
+        scales: PriceScales,
+    ) -> UpstreamFuture<'_, Vec<OracleObservation>, Self::Error> {
+        Box::pin(async move {
+            let payload = ReadOnlyUpstream::meta_and_asset_ctxs(&mut self.info)
+                .await
+                .map_err(LiveTransportError::Http)?;
+            let observed_at_ms = self.clock.now_ms();
+            parse_meta_and_asset_ctxs(&payload, observed_at_ms, upstream_sequence, scales)
+                .map_err(LiveTransportError::Parse)
+        })
+    }
+}
+
 /// Parses one public WebSocket `activeAssetCtx` update.
 pub fn parse_active_asset_ctx(
     value: &Value,
@@ -386,15 +666,17 @@ pub async fn read_observations<U: ReadOnlyUpstream, C: Clock>(
     upstream_sequence: u64,
     scales: PriceScales,
 ) -> Result<Vec<OracleObservation>, OracleReadError<U::Error>> {
-    let observed_at_ms = clock.now_ms();
-    if let Ok(Some(value)) = upstream.next_active_asset_ctx().await
-        && let Ok(observation) =
+    if let Ok(Some(value)) = upstream.next_active_asset_ctx().await {
+        let observed_at_ms = clock.now_ms();
+        if let Ok(observation) =
             parse_active_asset_ctx(&value, observed_at_ms, upstream_sequence, scales)
-    {
-        return Ok(vec![observation]);
+        {
+            return Ok(vec![observation]);
+        }
     }
 
     let fallback = upstream.meta_and_asset_ctxs().await.map_err(OracleReadError::Upstream)?;
+    let observed_at_ms = clock.now_ms();
     parse_meta_and_asset_ctxs(&fallback, observed_at_ms, upstream_sequence, scales)
         .map_err(OracleReadError::Parse)
 }
