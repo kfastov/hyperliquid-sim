@@ -279,7 +279,7 @@ fn fixed_asset_books_are_independent() {
 
 #[test]
 fn replay_is_identical_and_ids_and_events_are_monotonic() {
-    let commands = vec![
+    let commands = [
         Command::PlaceBatch {
             user: user('a'),
             timestamp: 10,
