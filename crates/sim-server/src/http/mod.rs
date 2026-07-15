@@ -75,7 +75,6 @@ struct AppState {
 type ApiResponse = (StatusCode, Json<Value>);
 
 /// Builds the complete HTTP router with explicitly injected bounded seams.
-#[must_use]
 pub fn router_with_config(
     runtime: Arc<dyn RuntimePort>,
     market: Arc<dyn MarketView>,
