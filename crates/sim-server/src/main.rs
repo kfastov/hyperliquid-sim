@@ -1,17 +1,665 @@
 mod config;
 
-use config::Config;
-use std::process::ExitCode;
+use config::{Config, OracleMode};
+use hl_wire::{AssetId, DecimalScale, PriceTicks};
+use oracle_hyperliquid::{
+    Clock, LiveConfig, NoJitter, ObservationSource, OracleIngestEvent, OracleObservation,
+    OracleOrchestrator, PriceScales, ReconnectBackoff, SystemClock, TokioHyperliquidTransport,
+    TokioSleeper, TransportFactory,
+};
+use sim_server::runtime::actors::SeededLocalActors;
+use sim_server::runtime::{RuntimeTask, RuntimeTaskError, start_runtime};
+use sim_server::{
+    RuntimeError, RuntimeHandle, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
+};
+use std::{fmt, process::ExitCode, sync::Arc, time::Duration};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
 
-fn main() -> ExitCode {
-    match Config::from_env() {
-        Ok(config) => {
-            println!("{}", config.validation_summary());
-            ExitCode::SUCCESS
+const LIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const LIVE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+const LIVE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const LIVE_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
+const LIVE_RECONNECT_MAXIMUM: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OracleCacheSnapshot {
+    latest: [Option<OracleObservation>; 3],
+    upstream_available: [bool; 3],
+    synthetic: bool,
+}
+
+impl OracleCacheSnapshot {
+    const fn empty(synthetic: bool) -> Self {
+        Self { latest: [None; 3], upstream_available: [false; 3], synthetic }
+    }
+
+    fn all_upstream_available(self) -> bool {
+        self.upstream_available.into_iter().all(|available| available)
+    }
+}
+
+/// Immutable shared lifecycle state. The watch value is the bounded, copy-on-write
+/// cache later projections and readiness can subscribe to without engine access.
+#[derive(Debug)]
+struct LifecycleState {
+    oracle_cache: watch::Sender<OracleCacheSnapshot>,
+}
+
+impl LifecycleState {
+    fn new(synthetic: bool) -> Arc<Self> {
+        let (oracle_cache, _) = watch::channel(OracleCacheSnapshot::empty(synthetic));
+        Arc::new(Self { oracle_cache })
+    }
+
+    fn snapshot(&self) -> OracleCacheSnapshot {
+        *self.oracle_cache.borrow()
+    }
+
+    fn observe(&self, observation: OracleObservation) {
+        self.oracle_cache.send_modify(|cache| {
+            let index = asset_index(observation.asset);
+            cache.latest[index] = Some(observation);
+            cache.upstream_available[index] = true;
+        });
+    }
+
+    fn unavailable(&self, asset: AssetId) {
+        self.oracle_cache.send_modify(|cache| cache.upstream_available[asset_index(asset)] = false);
+    }
+
+    async fn wait_for_all_upstream(&self, bound: Duration) -> bool {
+        let mut cache = self.oracle_cache.subscribe();
+        if cache.borrow().all_upstream_available() {
+            return true;
         }
+        tokio::time::timeout(bound, async move {
+            loop {
+                if cache.changed().await.is_err() {
+                    return false;
+                }
+                if cache.borrow().all_upstream_available() {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LiveOracleFactory {
+    config: LiveConfig,
+}
+
+impl LiveOracleFactory {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            config: LiveConfig {
+                ws_url: config.oracle_wss_url.to_string(),
+                info_url: config.oracle_info_url.to_string(),
+                connect_timeout: LIVE_CONNECT_TIMEOUT,
+                write_timeout: LIVE_WRITE_TIMEOUT,
+                read_timeout: config.oracle_completeness_timeout,
+                send_timeout: LIVE_SEND_TIMEOUT,
+                heartbeat_interval: LIVE_HEARTBEAT_INTERVAL,
+            },
+        }
+    }
+}
+
+impl TransportFactory for LiveOracleFactory {
+    type Transport = TokioHyperliquidTransport<SystemClock>;
+
+    fn create(&mut self) -> Self::Transport {
+        TokioHyperliquidTransport::new(self.config.clone(), SystemClock)
+    }
+}
+
+#[derive(Debug)]
+enum LifecycleError {
+    Runtime(RuntimeError),
+    RuntimeReplyTimedOut,
+    UnexpectedRuntimeReply,
+    IngestionTaskFailed,
+    IngestionTaskTimedOut,
+    RuntimeTask(RuntimeTaskError),
+    Signal(std::io::Error),
+}
+
+impl fmt::Display for LifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(formatter, "runtime boundary failed: {error}"),
+            Self::RuntimeReplyTimedOut => formatter.write_str("runtime reply exceeded its bound"),
+            Self::UnexpectedRuntimeReply => {
+                formatter.write_str("runtime returned an unexpected reply")
+            }
+            Self::IngestionTaskFailed => formatter.write_str("oracle ingestion task failed"),
+            Self::IngestionTaskTimedOut => {
+                formatter.write_str("oracle ingestion did not stop within its bound")
+            }
+            Self::RuntimeTask(error) => write!(formatter, "runtime owner failed: {error}"),
+            Self::Signal(error) => write!(formatter, "shutdown signal handler failed: {error}"),
+        }
+    }
+}
+
+struct ServiceLifecycle {
+    state: Arc<LifecycleState>,
+    runtime: RuntimeHandle,
+    runtime_task: RuntimeTask,
+    cancel: watch::Sender<bool>,
+    ingestion_task: JoinHandle<Result<(), LifecycleError>>,
+    reply_timeout: Duration,
+    shutdown_timeout: Duration,
+}
+
+impl ServiceLifecycle {
+    async fn shutdown(self) -> Result<(), LifecycleError> {
+        let Self {
+            runtime,
+            runtime_task,
+            cancel,
+            mut ingestion_task,
+            reply_timeout,
+            shutdown_timeout,
+            ..
+        } = self;
+
+        let _ = cancel.send(true);
+        let ingestion_result =
+            match tokio::time::timeout(shutdown_timeout, &mut ingestion_task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(LifecycleError::IngestionTaskFailed),
+                Err(_) => {
+                    ingestion_task.abort();
+                    let _ = ingestion_task.await;
+                    Err(LifecycleError::IngestionTaskTimedOut)
+                }
+            };
+
+        let shutdown_result =
+            request_with_timeout(&runtime, RuntimeRequest::Shutdown, reply_timeout).await.and_then(
+                |reply| {
+                    if reply == RuntimeReply::Shutdown {
+                        Ok(())
+                    } else {
+                        Err(LifecycleError::UnexpectedRuntimeReply)
+                    }
+                },
+            );
+        drop(runtime);
+        let owner_result =
+            runtime_task.wait(shutdown_timeout).await.map_err(LifecycleError::RuntimeTask);
+
+        ingestion_result?;
+        shutdown_result?;
+        owner_result
+    }
+}
+
+fn start_lifecycle(config: &Config) -> ServiceLifecycle {
+    let limits = RuntimeLimits::new(config.command_capacity, config.event_capacity);
+    let (runtime, runtime_task) = start_runtime(config.seed, limits);
+    let state = LifecycleState::new(config.oracle_mode == OracleMode::Offline);
+    let (cancel, cancel_receiver) = watch::channel(false);
+    let event_capacity = config.event_capacity.get();
+    let (oracle_events, receiver) = mpsc::channel(event_capacity);
+    let producer_cancel = cancel_receiver.clone();
+
+    let producer = match config.oracle_mode {
+        OracleMode::Offline => {
+            tokio::spawn(run_offline_oracle(oracle_events, producer_cancel, config.actor_interval))
+        }
+        OracleMode::Live => {
+            let orchestrator = OracleOrchestrator::new(
+                LiveOracleFactory::from_config(config),
+                TokioSleeper,
+                NoJitter,
+                SystemClock,
+                ReconnectBackoff::new(LIVE_RECONNECT_INITIAL, LIVE_RECONNECT_MAXIMUM),
+                fixed_price_scales(),
+            )
+            .with_primary_completeness_timeout(config.oracle_completeness_timeout);
+            tokio::spawn(async move {
+                let _ = orchestrator.run(oracle_events, producer_cancel).await;
+            })
+        }
+    };
+
+    let ingestion_task = tokio::spawn(run_ingestion(
+        receiver,
+        cancel_receiver,
+        producer,
+        runtime.clone(),
+        state.clone(),
+        config.actors_enabled.then(|| SeededLocalActors::new(config.seed)),
+        config.actor_interval,
+        config.reply_timeout,
+        event_capacity,
+    ));
+
+    ServiceLifecycle {
+        state,
+        runtime,
+        runtime_task,
+        cancel,
+        ingestion_task,
+        reply_timeout: config.reply_timeout,
+        shutdown_timeout: config.shutdown_timeout,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_ingestion(
+    mut events: mpsc::Receiver<OracleIngestEvent>,
+    mut cancel: watch::Receiver<bool>,
+    mut producer: JoinHandle<()>,
+    runtime: RuntimeHandle,
+    state: Arc<LifecycleState>,
+    mut actors: Option<SeededLocalActors>,
+    actor_interval: Duration,
+    reply_timeout: Duration,
+    pending_capacity: usize,
+) -> Result<(), LifecycleError> {
+    let result = if actors.is_some() {
+        let mut interval = tokio::time::interval(actor_interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut pending = Vec::with_capacity(pending_capacity.min(64));
+        loop {
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break Ok(());
+                    }
+                }
+                _ = interval.tick(), if !pending.is_empty() => {
+                    let observations = std::mem::take(&mut pending);
+                    forward_observations(
+                        &runtime,
+                        actors.as_mut(),
+                        &observations,
+                        SystemClock.now_ms(),
+                        reply_timeout,
+                    ).await?;
+                }
+                event = events.recv(), if pending.len() < pending_capacity => match event {
+                    Some(OracleIngestEvent::Observation(observation)) => {
+                        state.observe(observation);
+                        pending.push(observation);
+                    }
+                    Some(OracleIngestEvent::Unavailable { asset, .. }) => state.unavailable(asset),
+                    None => break Ok(()),
+                }
+            }
+        }
+    } else {
+        loop {
+            tokio::select! {
+                biased;
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break Ok(());
+                    }
+                }
+                event = events.recv() => match event {
+                    Some(OracleIngestEvent::Observation(observation)) => {
+                        state.observe(observation);
+                        forward_observations(
+                            &runtime,
+                            None,
+                            &[observation],
+                            observation.observed_at_ms,
+                            reply_timeout,
+                        ).await?;
+                    }
+                    Some(OracleIngestEvent::Unavailable { asset, .. }) => state.unavailable(asset),
+                    None => break Ok(()),
+                }
+            }
+        }
+    };
+
+    let producer_aborted = !producer.is_finished() && !*cancel.borrow();
+    if producer_aborted {
+        producer.abort();
+    }
+    match tokio::time::timeout(reply_timeout, &mut producer).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) if producer_aborted => {}
+        Ok(Err(_)) => return Err(LifecycleError::IngestionTaskFailed),
+        Err(_) => {
+            producer.abort();
+            let _ = producer.await;
+        }
+    }
+    result
+}
+
+async fn forward_observations(
+    runtime: &dyn RuntimePort,
+    actors: Option<&mut SeededLocalActors>,
+    observations: &[OracleObservation],
+    logical_time: u64,
+    reply_timeout: Duration,
+) -> Result<(), LifecycleError> {
+    if let Some(actors) = actors {
+        tokio::time::timeout(reply_timeout, actors.run_step(runtime, logical_time, observations))
+            .await
+            .map_err(|_| LifecycleError::RuntimeReplyTimedOut)?
+            .map_err(LifecycleError::Runtime)?;
+        return Ok(());
+    }
+
+    for observation in observations {
+        let reply = request_with_timeout(
+            runtime,
+            RuntimeRequest::ObserveOracle(*observation),
+            reply_timeout,
+        )
+        .await?;
+        if !matches!(reply, RuntimeReply::OracleObserved(Ok(()))) {
+            return Err(LifecycleError::UnexpectedRuntimeReply);
+        }
+    }
+    Ok(())
+}
+
+async fn request_with_timeout(
+    runtime: &dyn RuntimePort,
+    request: RuntimeRequest,
+    bound: Duration,
+) -> Result<RuntimeReply, LifecycleError> {
+    let deadline = Instant::now() + bound;
+    let pending = loop {
+        match runtime.try_request(request.clone()) {
+            Ok(pending) => break pending,
+            Err(RuntimeError::Overloaded) if Instant::now() < deadline => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => return Err(LifecycleError::Runtime(error)),
+        }
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    tokio::time::timeout(remaining, pending.receive())
+        .await
+        .map_err(|_| LifecycleError::RuntimeReplyTimedOut)?
+        .map_err(LifecycleError::Runtime)
+}
+
+async fn run_offline_oracle(
+    output: mpsc::Sender<OracleIngestEvent>,
+    mut cancel: watch::Receiver<bool>,
+    period: Duration,
+) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut sequence = 0_u64;
+    loop {
+        tokio::select! {
+            biased;
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+            _ = interval.tick() => {
+                sequence = sequence.saturating_add(1);
+                let observed_at_ms = SystemClock.now_ms();
+                for observation in synthetic_observations(observed_at_ms, sequence) {
+                    if output.send(OracleIngestEvent::Observation(observation)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fixed deterministic demo values. These are synthetic ticks, never fetched from
+/// Hyperliquid or represented as executable upstream prices.
+fn synthetic_observations(observed_at_ms: u64, upstream_sequence: u64) -> [OracleObservation; 3] {
+    [
+        synthetic_observation(AssetId::BTC, 1_000_000, observed_at_ms, upstream_sequence),
+        synthetic_observation(AssetId::ETH, 300_000, observed_at_ms, upstream_sequence),
+        synthetic_observation(AssetId::SOL, 150_000, observed_at_ms, upstream_sequence),
+    ]
+}
+
+fn synthetic_observation(
+    asset: AssetId,
+    ticks: i64,
+    observed_at_ms: u64,
+    upstream_sequence: u64,
+) -> OracleObservation {
+    OracleObservation {
+        asset,
+        price: PriceTicks::new(ticks).expect("fixed synthetic price is positive"),
+        observed_at_ms,
+        upstream_sequence,
+        // The frozen oracle source enum has no synthetic variant. LifecycleState::synthetic
+        // is the explicit local provenance marker consumed by later projections/readiness.
+        source: ObservationSource::MetaAndAssetCtxs,
+    }
+}
+
+fn fixed_price_scales() -> PriceScales {
+    PriceScales::new(
+        DecimalScale::new(1).expect("BTC price scale is valid"),
+        DecimalScale::new(2).expect("ETH price scale is valid"),
+        DecimalScale::new(3).expect("SOL price scale is valid"),
+    )
+}
+
+const fn asset_index(asset: AssetId) -> usize {
+    match asset {
+        AssetId::BTC => 0,
+        AssetId::ETH => 1,
+        AssetId::SOL => 2,
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<(), LifecycleError> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(LifecycleError::Signal)?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(LifecycleError::Signal),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map_err(LifecycleError::Signal)
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let config = match Config::from_env() {
+        Ok(config) => config,
         Err(error) => {
             eprintln!("sim-server configuration invalid: {error}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
         }
+    };
+    println!("{}", config.validation_summary());
+
+    let lifecycle = start_lifecycle(&config);
+    let upstream_available = lifecycle.state.wait_for_all_upstream(config.reply_timeout).await;
+    println!(
+        "sim-server readiness: lifecycle=running upstream_available={} synthetic={} assets=BTC,ETH,SOL listener=disabled",
+        upstream_available,
+        lifecycle.state.snapshot().synthetic,
+    );
+
+    if let Err(error) = wait_for_shutdown_signal().await {
+        eprintln!("sim-server lifecycle failed: {error}");
+        let _ = lifecycle.shutdown().await;
+        return ExitCode::FAILURE;
+    }
+    match lifecycle.shutdown().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sim-server shutdown failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oracle_hyperliquid::{OracleFreshness, OracleTransport};
+    use sim_core::Engine;
+    use sim_server::runtime::OracleAssetHealth;
+    use sim_server::{RuntimeReply, bounded_runtime};
+    use std::{num::NonZeroUsize, sync::Mutex};
+
+    fn test_config(actors_enabled: bool) -> Config {
+        Config::from_pairs(&[
+            ("SIM_ACTORS_ENABLED", if actors_enabled { "true" } else { "false" }),
+            ("SIM_ACTOR_INTERVAL_MS", "5"),
+            ("SIM_REPLY_TIMEOUT_MS", "500"),
+            ("SIM_SHUTDOWN_TIMEOUT_MS", "500"),
+        ])
+        .expect("test lifecycle config")
+    }
+
+    async fn runtime_request(runtime: &dyn RuntimePort, request: RuntimeRequest) -> RuntimeReply {
+        request_with_timeout(runtime, request, Duration::from_millis(500))
+            .await
+            .expect("runtime request")
+    }
+
+    #[tokio::test]
+    async fn offline_mode_makes_all_three_synthetic_assets_fresh() {
+        let lifecycle = start_lifecycle(&test_config(false));
+        assert!(lifecycle.state.wait_for_all_upstream(Duration::from_millis(500)).await);
+        let cache = lifecycle.state.snapshot();
+        assert!(cache.synthetic);
+        assert_eq!(
+            cache.latest.map(|item| item.map(|observation| observation.asset)),
+            [Some(AssetId::BTC), Some(AssetId::ETH), Some(AssetId::SOL)]
+        );
+
+        let RuntimeReply::OracleHealth(health) =
+            runtime_request(&lifecycle.runtime, RuntimeRequest::OracleHealth).await
+        else {
+            panic!("oracle health reply")
+        };
+        for asset in health.assets {
+            assert!(matches!(
+                asset,
+                OracleAssetHealth::Observed { freshness: OracleFreshness::Fresh { .. }, .. }
+            ));
+        }
+        lifecycle.shutdown().await.expect("bounded shutdown");
+    }
+
+    #[test]
+    fn live_factory_exposes_only_the_read_only_transport_capability() {
+        fn assert_factory<F>(_: &F)
+        where
+            F: TransportFactory,
+            F::Transport: OracleTransport,
+        {
+        }
+        let config = Config::from_pairs(&[("SIM_ORACLE_MODE", "live")]).expect("live config");
+        let factory = LiveOracleFactory::from_config(&config);
+        assert_factory(&factory);
+        assert_eq!(factory.config.info_url, "https://api.hyperliquid.xyz/info");
+        assert_eq!(factory.config.ws_url, "wss://api.hyperliquid.xyz/ws");
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_join_exit_within_the_configured_bound() {
+        let lifecycle = start_lifecycle(&test_config(false));
+        tokio::time::timeout(Duration::from_secs(1), lifecycle.shutdown())
+            .await
+            .expect("shutdown itself is bounded")
+            .expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_terminates_the_runtime_owner() {
+        let lifecycle = start_lifecycle(&test_config(false));
+        let runtime = lifecycle.runtime.clone();
+        lifecycle.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(
+            runtime.try_request(RuntimeRequest::EngineSnapshot).unwrap_err(),
+            RuntimeError::ShuttingDown
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_toggle_never_submits_an_observation_twice() {
+        for actors_enabled in [false, true] {
+            let limits =
+                RuntimeLimits::new(NonZeroUsize::new(32).unwrap(), NonZeroUsize::new(32).unwrap());
+            let (runtime, mut owner, _) = bounded_runtime(limits);
+            let recorded = Arc::new(Mutex::new(Vec::new()));
+            let owner_recorded = recorded.clone();
+            let owner_task = tokio::spawn(async move {
+                let mut engine = Engine::new(7);
+                while let Some(envelope) = owner.recv().await {
+                    owner_recorded.lock().unwrap().push(envelope.request.clone());
+                    let reply = match &envelope.request {
+                        RuntimeRequest::ObserveOracle(_) => RuntimeReply::OracleObserved(Ok(())),
+                        RuntimeRequest::Apply(command) => {
+                            RuntimeReply::Applied(engine.apply(command.clone()))
+                        }
+                        RuntimeRequest::Shutdown => {
+                            let _ = envelope.respond(Ok(RuntimeReply::Shutdown));
+                            break;
+                        }
+                        _ => panic!("unexpected test request"),
+                    };
+                    let _ = envelope.respond(Ok(reply));
+                }
+            });
+            let observations = synthetic_observations(SystemClock.now_ms(), 1);
+            let mut actors = actors_enabled.then(|| SeededLocalActors::new(7));
+            forward_observations(
+                &runtime,
+                actors.as_mut(),
+                &observations,
+                SystemClock.now_ms(),
+                Duration::from_millis(500),
+            )
+            .await
+            .expect("forward observations");
+
+            let observed = {
+                let requests = recorded.lock().unwrap();
+                requests
+                    .iter()
+                    .filter(|request| matches!(request, RuntimeRequest::ObserveOracle(_)))
+                    .count()
+            };
+            assert_eq!(observed, observations.len(), "actors_enabled={actors_enabled}");
+            let _ = runtime_request(&runtime, RuntimeRequest::Shutdown).await;
+            owner_task.await.expect("test owner exits");
+        }
+    }
+
+    #[test]
+    fn unavailable_is_immediate_cache_state_without_discarding_latest_value() {
+        let state = LifecycleState::new(false);
+        let observation = synthetic_observations(1, 1)[0];
+        state.observe(observation);
+        state.unavailable(AssetId::BTC);
+        let cache = state.snapshot();
+        assert_eq!(cache.latest[0], Some(observation));
+        assert!(!cache.upstream_available[0]);
     }
 }

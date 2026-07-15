@@ -79,7 +79,7 @@ impl Config {
     }
 
     #[cfg(test)]
-    fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ConfigError> {
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ConfigError> {
         use std::collections::BTreeMap;
 
         let values = pairs
