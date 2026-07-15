@@ -8,7 +8,9 @@
       "Cargo.lock",
       "crates/oracle-hyperliquid/**",
       "crates/sim-server/Cargo.toml",
+      "crates/sim-server/src/http/**",
       "crates/sim-server/src/runtime/**",
+      "crates/sim-server/tests/http/**",
       "crates/sim-server/tests/runtime/**"
     ],
     "forbidden": [
@@ -18,7 +20,6 @@
       "AGENTS.md",
       "docs/**",
       "crates/sim-core/**",
-      "crates/sim-server/src/http/**",
       "crates/sim-server/src/ws/**",
       "deploy/**"
     ]
@@ -38,6 +39,7 @@
       "cargo fmt --all -- --check",
       "cargo clippy -p oracle-hyperliquid -p sim-server --all-targets -- -D warnings",
       "cargo test -p oracle-hyperliquid",
+      "cargo test -p sim-server --test http",
       "cargo test -p sim-server --test runtime",
       "cargo test --workspace",
       "python3 -m unittest discover -s tests -v",
@@ -61,5 +63,5 @@
     "Wall-clock or unseeded randomness can make actor and event behavior irreproducible.",
     "An overly broad upstream client can violate the no-real-trading safety boundary."
   ],
-  "notes": "Manifest edits are the only intentional write-scope overlap with task #2 and are limited to adding the oracle/runtime dependencies that cannot compile before the oracle crate exists."
+  "notes": "Manifest edits overlap task #2 only for oracle/runtime dependencies. The HTTP scope was added by contract amendment task #17 after task #5 introduced the typed RuntimeError::OracleStale variant inside its original runtime scope and the accepted task #3 adapter's exhaustive match made the merge result fail. HTTP changes in task #5 are limited to mapping typed runtime oracle errors and associated focused regressions; unrelated adapter behavior remains out of scope."
 }
