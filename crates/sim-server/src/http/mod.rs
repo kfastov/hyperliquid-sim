@@ -75,6 +75,12 @@ struct AppState {
     config: HttpConfig,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedAction {
+    Order { input_count: usize },
+    Cancel { input_count: usize },
+}
+
 type ApiResponse = (StatusCode, Json<Value>);
 
 /// Builds the complete HTTP router with explicitly injected bounded seams.
@@ -230,7 +236,7 @@ async fn exchange(
     }
 
     let timestamp = envelope.nonce;
-    let command = match envelope.action {
+    let (command, expected_action) = match envelope.action {
         ExchangeAction::Order { orders, .. } => {
             if orders.is_empty() {
                 return invalid("order batch must not be empty");
@@ -262,7 +268,8 @@ async fn exchange(
                     );
                 }
             }
-            let mut translated = Vec::with_capacity(orders.len());
+            let input_count = orders.len();
+            let mut translated = Vec::with_capacity(input_count);
             for order in orders {
                 let asset = order.asset.asset();
                 let price = match PriceTicks::parse(order.limit_px.as_str(), price_scale(asset)) {
@@ -287,7 +294,10 @@ async fn exchange(
                     client_order_id: order.cloid.map(|cloid| cloid.as_str().to_owned()),
                 });
             }
-            Command::PlaceBatch { user, timestamp, orders: translated }
+            (
+                Command::PlaceBatch { user, timestamp, orders: translated },
+                ExpectedAction::Order { input_count },
+            )
         }
         ExchangeAction::Cancel { cancels } => {
             if cancels.is_empty() {
@@ -296,22 +306,26 @@ async fn exchange(
             if cancels.len() > state.config.max_batch {
                 return invalid("cancel batch exceeds configured limit");
             }
-            Command::CancelBatch {
-                user,
-                timestamp,
-                cancels: cancels
-                    .into_iter()
-                    .map(|cancel| CancelOrder {
-                        asset: cancel.asset.asset(),
-                        order_id: cancel.order_id,
-                    })
-                    .collect(),
-            }
+            let input_count = cancels.len();
+            (
+                Command::CancelBatch {
+                    user,
+                    timestamp,
+                    cancels: cancels
+                        .into_iter()
+                        .map(|cancel| CancelOrder {
+                            asset: cancel.asset.asset(),
+                            order_id: cancel.order_id,
+                        })
+                        .collect(),
+                },
+                ExpectedAction::Cancel { input_count },
+            )
         }
     };
 
     match runtime_request(&state, RuntimeRequest::Apply(command)).await {
-        Ok(RuntimeReply::Applied(result)) => exchange_result(result),
+        Ok(RuntimeReply::Applied(result)) => exchange_result(result, expected_action),
         Ok(_) => internal("runtime returned an unexpected reply"),
         Err(response) => response,
     }
@@ -361,7 +375,20 @@ async fn clearinghouse_state(state: &AppState, user: SimUserId) -> ApiResponse {
     }))
 }
 
-fn exchange_result(result: ApplyResult) -> ApiResponse {
+fn exchange_result(result: ApplyResult, expected_action: ExpectedAction) -> ApiResponse {
+    let corresponds = match (&result.result, expected_action) {
+        (CommandResult::Placement { statuses }, ExpectedAction::Order { input_count }) => {
+            statuses.len() == input_count
+        }
+        (CommandResult::Cancellation { statuses }, ExpectedAction::Cancel { input_count }) => {
+            statuses.len() == input_count
+        }
+        _ => false,
+    };
+    if !corresponds {
+        return internal("runtime returned an invalid apply result");
+    }
+
     let kind =
         if matches!(&result.result, CommandResult::Placement { .. }) { "order" } else { "cancel" };
     let statuses = match result.result {

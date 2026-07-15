@@ -5,13 +5,15 @@ use axum::{
 use hl_wire::{AssetId, PriceTicks};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use sim_core::Engine;
+use sim_core::{
+    ApplyResult, CancelStatus, CommandResult, Engine, PlacementDisposition, PlacementStatus,
+};
 use sim_server::http::{
     HttpConfig, MarketObservation, MarketSnapshot, MarketView, MarketViewError, router_with_config,
 };
 use sim_server::{
-    RuntimeError, RuntimeEvent, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
-    bounded_runtime,
+    PendingRuntimeReply, RuntimeError, RuntimeEvent, RuntimeHandle, RuntimeLimits, RuntimePort,
+    RuntimeReply, RuntimeRequest, bounded_runtime,
 };
 use std::{
     num::NonZeroUsize,
@@ -62,6 +64,29 @@ impl RuntimePort for OverloadedPort {
         drop(tx);
         rx
     }
+}
+
+struct FakeRuntimePort(RuntimeHandle);
+
+impl RuntimePort for FakeRuntimePort {
+    fn try_request(&self, request: RuntimeRequest) -> Result<PendingRuntimeReply, RuntimeError> {
+        self.0.try_request(request)
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.0.subscribe_events()
+    }
+}
+
+fn fake_runtime_reply(reply: RuntimeReply) -> Arc<dyn RuntimePort> {
+    let limits = RuntimeLimits::new(NonZeroUsize::MIN, NonZeroUsize::MIN);
+    let (port, mut owner, _) = bounded_runtime(limits);
+    tokio::spawn(async move {
+        let envelope = owner.recv().await.expect("HTTP request reached fake runtime");
+        assert!(matches!(envelope.request, RuntimeRequest::Apply(_)));
+        envelope.respond(Ok(reply)).expect("HTTP handler receives fake reply");
+    });
+    Arc::new(FakeRuntimePort(port))
 }
 
 fn market(stale: Option<AssetId>) -> Arc<dyn MarketView> {
@@ -406,4 +431,73 @@ async fn accepted_runtime_request_without_reply_times_out_stably() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["category"], "internal");
     assert_eq!(body["error"]["message"], "runtime is unavailable");
+}
+
+fn applied(result: CommandResult) -> RuntimeReply {
+    RuntimeReply::Applied(ApplyResult { result, events: Vec::new() })
+}
+
+fn resting_status(order_id: u64) -> PlacementStatus {
+    PlacementStatus::Accepted {
+        order_id,
+        filled_lots: 0,
+        remaining_lots: 1,
+        disposition: PlacementDisposition::Resting,
+    }
+}
+
+async fn assert_invalid_apply_reply(runtime: Arc<dyn RuntimePort>, action: Value) {
+    let (status, body) =
+        post(app(runtime, market(None), 8), "/exchange", exchange(action), Some(ALICE)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body={body}");
+    assert_eq!(body["error"]["category"], "internal");
+    assert_eq!(body["error"]["message"], "runtime returned an invalid apply result");
+}
+
+#[tokio::test]
+async fn order_rejects_wrong_inner_result_and_status_cardinality() {
+    let action = || {
+        json!({"type":"order","orders":[
+            order(0,true,"60000.1","0.00001","Gtc"),
+            order(1,true,"3000.25","0.0001","Gtc")
+        ],"grouping":"na"})
+    };
+    let invalid_replies = [
+        applied(CommandResult::Cancellation {
+            statuses: vec![
+                CancelStatus::Cancelled { order_id: 1, cancelled_lots: 1 },
+                CancelStatus::Cancelled { order_id: 2, cancelled_lots: 1 },
+            ],
+        }),
+        applied(CommandResult::Placement { statuses: vec![resting_status(1)] }),
+        applied(CommandResult::Placement {
+            statuses: vec![resting_status(1), resting_status(2), resting_status(3)],
+        }),
+    ];
+
+    for reply in invalid_replies {
+        assert_invalid_apply_reply(fake_runtime_reply(reply), action()).await;
+    }
+}
+
+#[tokio::test]
+async fn cancel_rejects_wrong_inner_result_and_status_cardinality() {
+    let action = || json!({"type":"cancel","cancels":[{"a":0,"o":1},{"a":1,"o":2}]});
+    let invalid_replies = [
+        applied(CommandResult::Placement { statuses: vec![resting_status(1), resting_status(2)] }),
+        applied(CommandResult::Cancellation {
+            statuses: vec![CancelStatus::Cancelled { order_id: 1, cancelled_lots: 1 }],
+        }),
+        applied(CommandResult::Cancellation {
+            statuses: vec![
+                CancelStatus::Cancelled { order_id: 1, cancelled_lots: 1 },
+                CancelStatus::Cancelled { order_id: 2, cancelled_lots: 1 },
+                CancelStatus::Cancelled { order_id: 3, cancelled_lots: 1 },
+            ],
+        }),
+    ];
+
+    for reply in invalid_replies {
+        assert_invalid_apply_reply(fake_runtime_reply(reply), action()).await;
+    }
 }
