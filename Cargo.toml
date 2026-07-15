@@ -17,6 +17,7 @@ axum = { version = "0.8", features = ["json", "ws"] }
 futures-util = "0.3"
 hl-wire = { path = "crates/hl-wire" }
 oracle-hyperliquid = { path = "crates/oracle-hyperliquid" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 http-body-util = "0.1"
 serde_json = "1"
 sim-core = { path = "crates/sim-core" }

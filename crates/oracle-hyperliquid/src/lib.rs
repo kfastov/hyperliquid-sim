@@ -1,13 +1,16 @@
 //! Capability-safe, read-only Hyperliquid oracle ingestion.
 //!
-//! The upstream trait deliberately exposes market-data reads only. This crate
-//! contains no wallet, signing, exchange, order, cancel, or transfer surface.
+//! The upstream boundary deliberately exposes public market-data reads only.
+//! This crate contains no wallet, signing, exchange, order, cancel, or transfer
+//! capability.
 
 use hl_wire::{AssetId, DecimalScale, PriceTicks, WireValueError};
 use serde::Deserialize;
-use serde_json::Value;
-use std::{error::Error, future::Future, pin::Pin};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, error::Error, future::Future, pin::Pin, time::Duration};
 use thiserror::Error;
+
+pub const STALE_AFTER_MS: u64 = 60_000;
 
 /// Boxed future used by the object-safe read-only upstream boundary.
 pub type UpstreamFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
@@ -15,14 +18,52 @@ pub type UpstreamFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + 
 /// The complete upstream capability available to the oracle.
 ///
 /// Implementations can subscribe to public `activeAssetCtx` data and perform
-/// the public `metaAndAssetCtxs` info query. State-changing methods cannot be
-/// invoked through this boundary because none exist.
+/// the public `metaAndAssetCtxs` info query. No state-changing method is
+/// expressible through this trait.
 pub trait ReadOnlyUpstream: Send {
     type Error: Error + Send + Sync + 'static;
 
     fn next_active_asset_ctx(&mut self) -> UpstreamFuture<'_, Option<Value>, Self::Error>;
-
     fn meta_and_asset_ctxs(&mut self) -> UpstreamFuture<'_, Value, Self::Error>;
+}
+
+/// A fallback-only client for Hyperliquid's public info endpoint.
+///
+/// It intentionally has no private key and can issue only the read-only
+/// `metaAndAssetCtxs` request. A WebSocket implementation can wrap this client
+/// and provide primary `activeAssetCtx` messages through [`ReadOnlyUpstream`].
+#[derive(Clone, Debug)]
+pub struct HyperliquidInfoClient {
+    client: reqwest::Client,
+    info_url: String,
+}
+
+impl HyperliquidInfoClient {
+    #[must_use]
+    pub fn new(info_url: impl Into<String>) -> Self {
+        Self { client: reqwest::Client::new(), info_url: info_url.into() }
+    }
+}
+
+impl ReadOnlyUpstream for HyperliquidInfoClient {
+    type Error = reqwest::Error;
+
+    fn next_active_asset_ctx(&mut self) -> UpstreamFuture<'_, Option<Value>, Self::Error> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn meta_and_asset_ctxs(&mut self) -> UpstreamFuture<'_, Value, Self::Error> {
+        Box::pin(async move {
+            self.client
+                .post(&self.info_url)
+                .json(&json!({"type": "metaAndAssetCtxs"}))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        })
+    }
 }
 
 /// Explicit normalization scales for the three supported assets.
@@ -49,23 +90,33 @@ impl PriceScales {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationSource {
+    ActiveAssetCtx,
+    MetaAndAssetCtxs,
+}
+
 /// A validated, normalized public oracle observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OracleObservation {
     pub asset: AssetId,
     pub price: PriceTicks,
     pub observed_at_ms: u64,
+    /// Sequence assigned by the ingestion owner. Ordering is checked per asset.
     pub upstream_sequence: u64,
+    pub source: ObservationSource,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum OracleParseError {
-    #[error("malformed activeAssetCtx message")]
+    #[error("malformed oracle message")]
     Malformed,
     #[error("unexpected upstream channel")]
     UnexpectedChannel,
     #[error("unsupported oracle asset")]
     UnsupportedAsset,
+    #[error("ambiguous oracle asset mapping")]
+    AmbiguousAsset,
     #[error("invalid oracle price: {0}")]
     InvalidPrice(WireValueError),
 }
@@ -89,9 +140,6 @@ struct ActiveAssetCtx {
 }
 
 /// Parses one public WebSocket `activeAssetCtx` update.
-///
-/// Symbol mapping is name-based rather than positional, preventing one asset's
-/// price from being applied to another book when upstream ordering changes.
 pub fn parse_active_asset_ctx(
     value: &Value,
     observed_at_ms: u64,
@@ -107,17 +155,190 @@ pub fn parse_active_asset_ctx(
         AssetId::from_symbol(&message.data.coin).map_err(|_| OracleParseError::UnsupportedAsset)?;
     let price = PriceTicks::parse(&message.data.ctx.oracle_px, scales.for_asset(asset))
         .map_err(OracleParseError::InvalidPrice)?;
-    Ok(OracleObservation { asset, price, observed_at_ms, upstream_sequence })
+    Ok(OracleObservation {
+        asset,
+        price,
+        observed_at_ms,
+        upstream_sequence,
+        source: ObservationSource::ActiveAssetCtx,
+    })
+}
+
+/// Parses the public `[meta, assetCtxs]` response by joining context entries to
+/// metadata names. Positional values are never mapped without validating the
+/// corresponding symbol.
+pub fn parse_meta_and_asset_ctxs(
+    value: &Value,
+    observed_at_ms: u64,
+    upstream_sequence: u64,
+    scales: PriceScales,
+) -> Result<Vec<OracleObservation>, OracleParseError> {
+    let pair =
+        value.as_array().filter(|pair| pair.len() == 2).ok_or(OracleParseError::Malformed)?;
+    let universe =
+        pair[0].get("universe").and_then(Value::as_array).ok_or(OracleParseError::Malformed)?;
+    let contexts = pair[1].as_array().ok_or(OracleParseError::Malformed)?;
+    if universe.len() != contexts.len() {
+        return Err(OracleParseError::Malformed);
+    }
+
+    let mut observations = BTreeMap::new();
+    for (metadata, context) in universe.iter().zip(contexts) {
+        let Some(symbol) = metadata.get("name").and_then(Value::as_str) else {
+            return Err(OracleParseError::Malformed);
+        };
+        let Ok(asset) = AssetId::from_symbol(symbol) else {
+            continue;
+        };
+        let oracle_px =
+            context.get("oraclePx").and_then(Value::as_str).ok_or(OracleParseError::Malformed)?;
+        let price = PriceTicks::parse(oracle_px, scales.for_asset(asset))
+            .map_err(OracleParseError::InvalidPrice)?;
+        let observation = OracleObservation {
+            asset,
+            price,
+            observed_at_ms,
+            upstream_sequence,
+            source: ObservationSource::MetaAndAssetCtxs,
+        };
+        if observations.insert(asset, observation).is_some() {
+            return Err(OracleParseError::AmbiguousAsset);
+        }
+    }
+    Ok(observations.into_values().collect())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationReject {
+    OutOfOrder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OracleFreshness {
+    Missing,
+    Fresh { age_ms: u64 },
+    Stale { age_ms: u64 },
+}
+
+/// Independent last-known-good state for each supported asset.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OracleState {
+    observations: BTreeMap<AssetId, OracleObservation>,
+}
+
+impl OracleState {
+    pub fn observe(&mut self, observation: OracleObservation) -> Result<(), ObservationReject> {
+        if self.observations.get(&observation.asset).is_some_and(|previous| {
+            observation.upstream_sequence <= previous.upstream_sequence
+                || observation.observed_at_ms < previous.observed_at_ms
+        }) {
+            return Err(ObservationReject::OutOfOrder);
+        }
+        self.observations.insert(observation.asset, observation);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn observation(&self, asset: AssetId) -> Option<OracleObservation> {
+        self.observations.get(&asset).copied()
+    }
+
+    #[must_use]
+    pub fn freshness(&self, asset: AssetId, now_ms: u64) -> OracleFreshness {
+        let Some(observation) = self.observation(asset) else {
+            return OracleFreshness::Missing;
+        };
+        let age_ms = now_ms.saturating_sub(observation.observed_at_ms);
+        if age_ms > STALE_AFTER_MS {
+            OracleFreshness::Stale { age_ms }
+        } else {
+            OracleFreshness::Fresh { age_ms }
+        }
+    }
+}
+
+/// Clock seam used by ingestion tests and runtime composition.
+pub trait Clock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
+#[derive(Debug, Error)]
+pub enum OracleReadError<E: Error> {
+    #[error("read-only upstream request failed: {0}")]
+    Upstream(E),
+    #[error(transparent)]
+    Parse(#[from] OracleParseError),
+}
+
+/// Reads one primary observation, falling back to `metaAndAssetCtxs` whenever
+/// the primary stream disconnects or returns an invalid/incomplete message.
+/// The caller owns the deterministic sequence and clock.
+pub async fn read_observations<U: ReadOnlyUpstream, C: Clock>(
+    upstream: &mut U,
+    clock: &C,
+    upstream_sequence: u64,
+    scales: PriceScales,
+) -> Result<Vec<OracleObservation>, OracleReadError<U::Error>> {
+    let observed_at_ms = clock.now_ms();
+    if let Ok(Some(value)) = upstream.next_active_asset_ctx().await
+        && let Ok(observation) =
+            parse_active_asset_ctx(&value, observed_at_ms, upstream_sequence, scales)
+    {
+        return Ok(vec![observation]);
+    }
+
+    let fallback = upstream.meta_and_asset_ctxs().await.map_err(OracleReadError::Upstream)?;
+    parse_meta_and_asset_ctxs(&fallback, observed_at_ms, upstream_sequence, scales)
+        .map_err(OracleReadError::Parse)
+}
+
+/// Bounded deterministic exponential reconnect schedule. Any production jitter
+/// is applied by the caller and never enters oracle or engine state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectBackoff {
+    initial_ms: u64,
+    maximum_ms: u64,
+    next_ms: u64,
+}
+
+impl ReconnectBackoff {
+    #[must_use]
+    pub fn new(initial: Duration, maximum: Duration) -> Self {
+        let initial_ms = u64::try_from(initial.as_millis()).unwrap_or(u64::MAX).max(1);
+        let maximum_ms = u64::try_from(maximum.as_millis()).unwrap_or(u64::MAX).max(initial_ms);
+        Self { initial_ms, maximum_ms, next_ms: initial_ms }
+    }
+
+    pub fn reset(&mut self) {
+        self.next_ms = self.initial_ms;
+    }
+
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.next_ms;
+        self.next_ms = self.next_ms.saturating_mul(2).min(self.maximum_ms);
+        Duration::from_millis(delay)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn scales() -> PriceScales {
         let scale = DecimalScale::new(2).expect("valid scale");
         PriceScales::new(scale, scale, scale)
+    }
+
+    fn active(symbol: &str, price: &str, time: u64, sequence: u64) -> OracleObservation {
+        parse_active_asset_ctx(
+            &json!({"channel":"activeAssetCtx","data":{"coin":symbol,"ctx":{"oraclePx":price}}}),
+            time,
+            sequence,
+            scales(),
+        )
+        .expect("valid active context")
     }
 
     #[test]
@@ -127,46 +348,130 @@ mod tests {
             (2, "ETH", AssetId::ETH, "3123.40", 312_340),
             (3, "SOL", AssetId::SOL, "142.01", 14_201),
         ] {
-            let message = json!({
-                "channel": "activeAssetCtx",
-                "data": {"coin": symbol, "ctx": {"oraclePx": price}}
-            });
-            let observation =
-                parse_active_asset_ctx(&message, 10_000, sequence, scales()).expect("valid update");
+            let observation = active(symbol, price, 10_000, sequence);
             assert_eq!(observation.asset, expected_asset);
             assert_eq!(observation.price.value(), expected_ticks);
-            assert_eq!(observation.observed_at_ms, 10_000);
-            assert_eq!(observation.upstream_sequence, sequence);
+            assert_eq!(observation.source, ObservationSource::ActiveAssetCtx);
         }
     }
 
     #[test]
-    fn rejects_unknown_malformed_and_non_positive_updates() {
-        let unknown = json!({
-            "channel": "activeAssetCtx",
-            "data": {"coin": "DOGE", "ctx": {"oraclePx": "1.00"}}
-        });
+    fn fallback_maps_names_not_positions_and_ignores_unsupported_assets() {
+        let response = json!([
+            {"universe": [{"name":"SOL"},{"name":"DOGE"},{"name":"BTC"},{"name":"ETH"}]},
+            [{"oraclePx":"142.01"},{"oraclePx":"0.20"},{"oraclePx":"60123.45"},{"oraclePx":"3123.40"}]
+        ]);
+        let observations =
+            parse_meta_and_asset_ctxs(&response, 9, 7, scales()).expect("valid fallback");
+        assert_eq!(observations.iter().map(|item| item.asset).collect::<Vec<_>>(), AssetId::ALL);
         assert_eq!(
-            parse_active_asset_ctx(&unknown, 0, 1, scales()),
-            Err(OracleParseError::UnsupportedAsset)
+            observations.iter().map(|item| item.price.value()).collect::<Vec<_>>(),
+            [6_012_345, 312_340, 14_201]
         );
+        assert!(observations.iter().all(|item| item.source == ObservationSource::MetaAndAssetCtxs));
+    }
 
-        let malformed = json!({
-            "channel": "activeAssetCtx",
-            "data": {"coin": "BTC", "ctx": {"oraclePx": 123}}
-        });
+    #[test]
+    fn malformed_non_positive_and_ambiguous_fallback_is_rejected() {
+        let zero = json!([{"universe":[{"name":"ETH"}]}, [{"oraclePx":"0"}]]);
         assert_eq!(
-            parse_active_asset_ctx(&malformed, 0, 1, scales()),
-            Err(OracleParseError::Malformed)
-        );
-
-        let zero = json!({
-            "channel": "activeAssetCtx",
-            "data": {"coin": "ETH", "ctx": {"oraclePx": "0"}}
-        });
-        assert_eq!(
-            parse_active_asset_ctx(&zero, 0, 1, scales()),
+            parse_meta_and_asset_ctxs(&zero, 0, 1, scales()),
             Err(OracleParseError::InvalidPrice(WireValueError::NonPositive))
         );
+        let duplicate = json!([{"universe":[{"name":"BTC"},{"name":"BTC"}]}, [{"oraclePx":"1"},{"oraclePx":"2"}]]);
+        assert_eq!(
+            parse_meta_and_asset_ctxs(&duplicate, 0, 1, scales()),
+            Err(OracleParseError::AmbiguousAsset)
+        );
+    }
+
+    struct FakeClock(AtomicU64);
+    impl Clock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn state_is_per_asset_ordered_and_stale_only_after_sixty_seconds() {
+        let clock = FakeClock(AtomicU64::new(61_000));
+        let mut state = OracleState::default();
+        state.observe(active("BTC", "100", 1_000, 2)).expect("first BTC");
+        state.observe(active("ETH", "20", 500, 1)).expect("independent ETH sequence");
+        assert_eq!(
+            state.freshness(AssetId::BTC, clock.now_ms()),
+            OracleFreshness::Fresh { age_ms: 60_000 }
+        );
+        clock.0.store(61_001, Ordering::Relaxed);
+        assert_eq!(
+            state.freshness(AssetId::BTC, clock.now_ms()),
+            OracleFreshness::Stale { age_ms: 60_001 }
+        );
+        assert_eq!(
+            state.observe(active("BTC", "101", 2_000, 2)),
+            Err(ObservationReject::OutOfOrder)
+        );
+        assert_eq!(state.observation(AssetId::BTC).expect("BTC retained").price.value(), 10_000);
+        assert_eq!(state.observation(AssetId::ETH).expect("ETH retained").price.value(), 2_000);
+        assert_eq!(state.freshness(AssetId::SOL, clock.now_ms()), OracleFreshness::Missing);
+    }
+
+    struct FakeUpstream {
+        primary: Option<Value>,
+        fallback: Value,
+        primary_reads: usize,
+        fallback_reads: usize,
+    }
+
+    impl ReadOnlyUpstream for FakeUpstream {
+        type Error = std::io::Error;
+
+        fn next_active_asset_ctx(&mut self) -> UpstreamFuture<'_, Option<Value>, Self::Error> {
+            self.primary_reads += 1;
+            let value = self.primary.take();
+            Box::pin(async move { Ok(value) })
+        }
+
+        fn meta_and_asset_ctxs(&mut self) -> UpstreamFuture<'_, Value, Self::Error> {
+            self.fallback_reads += 1;
+            let value = self.fallback.clone();
+            Box::pin(async move { Ok(value) })
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_primary_uses_only_read_only_fallback_with_fake_clock() {
+        let clock = FakeClock(AtomicU64::new(42_000));
+        let mut upstream = FakeUpstream {
+            primary: None,
+            fallback: json!([
+                {"universe":[{"name":"BTC"},{"name":"ETH"},{"name":"SOL"}]},
+                [{"oraclePx":"100"},{"oraclePx":"20"},{"oraclePx":"3"}]
+            ]),
+            primary_reads: 0,
+            fallback_reads: 0,
+        };
+        let observations =
+            read_observations(&mut upstream, &clock, 9, scales()).await.expect("fallback succeeds");
+        assert_eq!(observations.len(), 3);
+        assert_eq!(upstream.primary_reads, 1);
+        assert_eq!(upstream.fallback_reads, 1);
+        assert!(observations.iter().all(|item| {
+            item.observed_at_ms == 42_000
+                && item.upstream_sequence == 9
+                && item.source == ObservationSource::MetaAndAssetCtxs
+        }));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_bounded_and_resettable() {
+        let mut schedule =
+            ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(350));
+        assert_eq!(
+            (0..5).map(|_| schedule.next_delay().as_millis()).collect::<Vec<_>>(),
+            [100, 200, 350, 350, 350]
+        );
+        schedule.reset();
+        assert_eq!(schedule.next_delay(), Duration::from_millis(100));
     }
 }
