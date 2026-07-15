@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stdlib-only external Probe-A for transport and initial snapshots.
+"""Stdlib-only external Probe-B1 for transport plus one-user state acceptance.
 
-This deliberately stops before order placement, trades, cancellation, and stale
-oracle behavior.  Its HTTP and RFC 6455 helpers are reusable by later probes.
+The default (or explicit ``--state-flow``) places and cancels one resting BTC
+GTC order. ``--basic-only`` preserves the Probe-A transport/snapshot path.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -22,12 +23,16 @@ from typing import Any, Optional
 from urllib import error, parse, request
 
 DEFAULT_USER = "0x1111111111111111111111111111111111111111"
+SIGNATURE_COMPONENT = "0x" + "a" * 64
 DEFAULT_TIMEOUT = 5.0
 MAX_TIMEOUT = 30.0
 MAX_HTTP_BODY = 1 << 20
 MAX_WS_PAYLOAD = 1 << 20
 MAX_HANDSHAKE = 16 << 10
+MAX_FILTERED_MESSAGES = 16
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+CANONICAL_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
+NORMALIZED_USER = re.compile(r"^0x[0-9a-f]{40}$")
 
 
 class ProbeFailure(RuntimeError):
@@ -354,7 +359,134 @@ def subscribe(ws: WebSocketClient, subscription: dict[str, Any], channel: str) -
     return snapshot
 
 
-def run_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str, Any]:
+def require_canonical(value: Any, expected: str, label: str) -> None:
+    require(
+        type(value) is str and CANONICAL_DECIMAL.fullmatch(value) is not None,
+        f"{label} is not a canonical decimal string: {value!r}",
+    )
+    require(value == expected, f"{label} expected {expected!r}, got {value!r}")
+
+
+def exchange_envelope(action: dict[str, Any], nonce: int) -> dict[str, Any]:
+    return {
+        "action": action,
+        "nonce": nonce,
+        "signature": {"r": SIGNATURE_COMPONENT, "s": SIGNATURE_COMPONENT, "v": 27},
+        "vaultAddress": None,
+    }
+
+
+def ordered_status(body: Any, response_type: str, operation: str) -> Any:
+    require(isinstance(body, dict) and set(body) == {"status", "response"}, f"{operation} response shape mismatch")
+    require(body["status"] == "ok", f"{operation} response status is not ok")
+    response = body["response"]
+    require(isinstance(response, dict) and set(response) == {"type", "data"}, f"{operation} inner response shape mismatch")
+    require(response["type"] == response_type, f"{operation} response type mismatch")
+    data = response["data"]
+    require(isinstance(data, dict) and set(data) == {"statuses"}, f"{operation} data shape mismatch")
+    statuses = data["statuses"]
+    require(isinstance(statuses, list) and len(statuses) == 1, f"{operation} expected exactly one ordered status")
+    return statuses[0]
+
+
+def validate_owned_update(message: Any, oid: int, status: str, previous_sequence: int) -> int:
+    require(isinstance(message, dict) and set(message) == {"channel", "sequence", "data"}, "order update envelope shape mismatch")
+    require(message["channel"] == "orderUpdates", "expected orderUpdates channel")
+    sequence = message["sequence"]
+    require(type(sequence) is int and sequence > previous_sequence, "order update sequence is not monotonic")
+    require(isinstance(message["data"], list) and len(message["data"]) == 1, "order update cardinality mismatch")
+    update = message["data"][0]
+    require(
+        isinstance(update, dict) and set(update) == {"order", "status", "statusTimestamp"},
+        f"order update shape mismatch: {update!r}",
+    )
+    require(update["status"] == status and type(update["statusTimestamp"]) is int, "order update status/timestamp mismatch")
+    order = update["order"]
+    require(
+        isinstance(order, dict)
+        and set(order) == {"coin", "side", "limitPx", "sz", "oid", "timestamp", "origSz", "cloid"},
+        f"owned order shape mismatch: {order!r}",
+    )
+    require(order["coin"] == "BTC" and order["side"] == "B" and order["oid"] == oid, "owned order identity mismatch")
+    require(type(order["timestamp"]) is int and order["cloid"] is None, "owned order timestamp/cloid mismatch")
+    require_canonical(order["limitPx"], "99999.9", "owned order limitPx")
+    require_canonical(order["sz"], "0.00001", "owned order sz")
+    require_canonical(order["origSz"], "0.00001", "owned order origSz")
+    return sequence
+
+
+def receive_owned_update(ws: WebSocketClient, oid: int, status: str, previous_sequence: int) -> int:
+    for _ in range(MAX_FILTERED_MESSAGES):
+        message = ws.receive_json()
+        if not isinstance(message, dict) or message.get("channel") != "orderUpdates":
+            continue
+        data = message.get("data")
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            continue
+        order = data[0].get("order")
+        if isinstance(order, dict) and order.get("oid") == oid and data[0].get("status") == status:
+            return validate_owned_update(message, oid, status, previous_sequence)
+    raise ProbeFailure(f"did not receive owned {status} update within {MAX_FILTERED_MESSAGES} filtered reads")
+
+
+def validate_open_order(order: Any, oid: int) -> None:
+    require(
+        isinstance(order, dict)
+        and set(order) == {"coin", "limitPx", "oid", "side", "sz", "timestamp", "origSz", "cloid"},
+        f"open order shape mismatch: {order!r}",
+    )
+    require(order["coin"] == "BTC" and order["side"] == "B" and order["oid"] == oid, "open order identity mismatch")
+    require(type(order["timestamp"]) is int and order["cloid"] is None, "open order timestamp/cloid mismatch")
+    require_canonical(order["limitPx"], "99999.9", "open order limitPx")
+    require_canonical(order["sz"], "0.00001", "open order sz")
+    require_canonical(order["origSz"], "0.00001", "open order origSz")
+
+
+def run_state_flow(
+    http: HttpClient,
+    ws_url: str,
+    timeout: float,
+    user: str,
+    websocket_factory: Any = WebSocketClient,
+) -> dict[str, int]:
+    ws = websocket_factory(ws_url, timeout, user)
+    try:
+        initial = subscribe(ws, {"type": "orderUpdates", "user": user}, "orderUpdates")
+        require(initial["data"] == [], "state flow requires an empty initial orderUpdates snapshot")
+        initial_sequence = initial["sequence"]
+
+        order_action = {
+            "type": "order",
+            "orders": [{"a": 0, "b": True, "p": "99999.9", "s": "0.00001", "r": False, "t": {"limit": {"tif": "Gtc"}}}],
+            "grouping": "na",
+        }
+        placed = require_ok(http.post_json("/exchange", exchange_envelope(order_action, 1000), user), "BTC GTC placement")
+        status = ordered_status(placed, "order", "BTC GTC placement")
+        require(isinstance(status, dict) and list(status) == ["resting"], "BTC GTC placement did not return resting status")
+        resting = status["resting"]
+        require(isinstance(resting, dict) and list(resting) == ["oid"] and type(resting["oid"]) is int, "resting status oid shape mismatch")
+        oid = resting["oid"]
+        placement_sequence = receive_owned_update(ws, oid, "open", initial_sequence)
+
+        open_orders = require_ok(http.post_json("/info", {"type": "openOrders", "user": user}, user), "openOrders after placement")
+        require(isinstance(open_orders, list) and len(open_orders) == 1, "openOrders after placement expected exactly one order")
+        validate_open_order(open_orders[0], oid)
+
+        cancel_action = {"type": "cancel", "cancels": [{"a": 0, "o": oid}]}
+        canceled = require_ok(http.post_json("/exchange", exchange_envelope(cancel_action, 1001), user), "BTC cancel")
+        require(ordered_status(canceled, "cancel", "BTC cancel") == "success", "BTC cancel status mismatch")
+        receive_owned_update(ws, oid, "canceled", placement_sequence)
+
+        remaining = require_ok(http.post_json("/info", {"type": "openOrders", "user": user}, user), "openOrders after cancel")
+        require(remaining == [], "canceled order remains in openOrders")
+        ws.close_cleanly()
+        return {"placements": 1, "cancels": 1}
+    except Exception:
+        ws.abort()
+        raise
+
+
+def run_basic_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str, Any]:
     started = time.monotonic()
     http = HttpClient(base_url, timeout)
     health = require_ok(http.get("/healthz"), "healthz")
@@ -422,6 +554,33 @@ def run_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str
     }
 
 
+def run_probe(
+    base_url: str,
+    ws_url: str,
+    timeout: float,
+    user: str,
+    basic_only: bool = False,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    summary = run_basic_probe(base_url, ws_url, timeout, user)
+    if basic_only:
+        return summary
+    summary["probe"] = "B1"
+    summary["counts"] = run_state_flow(HttpClient(base_url, timeout), ws_url, timeout, user)
+    summary["checks"].extend([
+        "ordered_placement_response",
+        "placement_update",
+        "open_orders_contains_oid",
+        "canonical_decimals",
+        "monotonic_event_sequence",
+        "ordered_cancel_response",
+        "cancel_update",
+        "open_orders_empty_after_cancel",
+    ])
+    summary["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    return summary
+
+
 def bounded_timeout(value: str) -> float:
     try:
         timeout = float(value)
@@ -437,15 +596,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--base-url", required=True, help="HTTP(S) service origin")
     parser.add_argument("--ws-url", required=True, help="WS(S) service endpoint")
     parser.add_argument("--timeout", type=bounded_timeout, default=DEFAULT_TIMEOUT, help="per-I/O timeout in seconds (0.1-30)")
-    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user for private initial snapshot")
+    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user for private state")
+    flow = parser.add_mutually_exclusive_group()
+    flow.add_argument("--state-flow", action="store_true", help="explicitly run the default one-user placement/cancel flow")
+    flow.add_argument("--basic-only", action="store_true", help="run Probe-A transport/snapshots without changing state")
     args = parser.parse_args(argv)
     try:
         _validate_header_value(args.user, "user")
-        summary = run_probe(args.base_url, args.ws_url, args.timeout, args.user)
+        require(NORMALIZED_USER.fullmatch(args.user) is not None, "user must be a normalized lowercase 0x address")
+        summary = run_probe(args.base_url, args.ws_url, args.timeout, args.user, args.basic_only)
     except Exception as exc:
         print(
             json.dumps(
-                {"result": "FAIL", "probe": "A", "error": type(exc).__name__, "message": str(exc)},
+                {"result": "FAIL", "probe": "A" if args.basic_only else "B1", "error": type(exc).__name__, "message": str(exc)},
                 separators=(",", ":"),
                 sort_keys=True,
             ),

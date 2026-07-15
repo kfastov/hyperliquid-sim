@@ -1,4 +1,4 @@
-"""Unit and fast real-process tests for external Probe-A.
+"""Unit and fast real-process tests for external Probe-A/B1.
 
 Run after building the current binary:
   cargo build --bin sim-server
@@ -166,8 +166,124 @@ class HttpTests(unittest.TestCase):
                 probe.bounded_timeout(value)
 
 
+def subscription_ack(subscription):
+    return {
+        "channel": "subscriptionResponse",
+        "data": {"method": "subscribe", "subscription": subscription},
+    }
+
+
+def order_update(sequence, oid, status, price="99999.9", size="0.00001"):
+    return {
+        "channel": "orderUpdates",
+        "sequence": sequence,
+        "data": [{
+            "order": {
+                "coin": "BTC", "side": "B", "limitPx": price, "sz": size,
+                "oid": oid, "timestamp": sequence, "origSz": size, "cloid": None,
+            },
+            "status": status,
+            "statusTimestamp": sequence,
+        }],
+    }
+
+
+class ScriptedWebSocket:
+    def __init__(self, setup, events):
+        self.setup = list(setup)
+        self.events = list(events)
+        self.sent = []
+        self.closed = False
+
+    def send_text_json(self, value):
+        self.sent.append(value)
+
+    def receive_json(self):
+        return self.setup.pop(0) if self.setup else self.events.pop(0)
+
+    def close_cleanly(self):
+        self.closed = True
+
+    def abort(self):
+        self.closed = True
+
+
+class ScriptedHttp:
+    def __init__(self, bodies):
+        self.bodies = list(bodies)
+        self.calls = []
+
+    def post_json(self, path, payload, user=None):
+        self.calls.append((path, payload, user))
+        return probe.HttpResponse(200, self.bodies.pop(0))
+
+
+def exchange_response(kind, status):
+    return {"status": "ok", "response": {"type": kind, "data": {"statuses": [status]}}}
+
+
+def open_order(oid, price="99999.9", size="0.00001"):
+    return {
+        "coin": "BTC", "limitPx": price, "oid": oid, "side": "B", "sz": size,
+        "timestamp": 1, "origSz": size, "cloid": None,
+    }
+
+
+class StateFlowTests(unittest.TestCase):
+    def dependencies(self):
+        subscription = {"type": "orderUpdates", "user": probe.DEFAULT_USER}
+        ws = ScriptedWebSocket(
+            [
+                subscription_ack(subscription),
+                {"channel": "orderUpdates", "sequence": 0, "data": []},
+            ],
+            [
+                {"channel": "allMids", "sequence": 1, "data": {"BTC": "100000"}},
+                order_update(1, 7, "open"),
+                order_update(2, 7, "open"),
+                order_update(3, 7, "canceled"),
+            ],
+        )
+        http = ScriptedHttp([
+            exchange_response("order", {"resting": {"oid": 7}}),
+            [open_order(7)],
+            exchange_response("cancel", "success"),
+            [],
+        ])
+        return http, ws
+
+    def test_mocked_one_user_place_cancel_flow_filters_messages(self):
+        http, ws = self.dependencies()
+        counts = probe.run_state_flow(
+            http, "ws://mock/ws", 0.1, probe.DEFAULT_USER,
+            lambda _url, _timeout, _user: ws,
+        )
+        self.assertEqual(counts, {"placements": 1, "cancels": 1})
+        self.assertTrue(ws.closed)
+        self.assertEqual([call[0] for call in http.calls], ["/exchange", "/info", "/exchange", "/info"])
+        self.assertTrue(all(call[2] == probe.DEFAULT_USER for call in http.calls))
+
+    def test_mocked_flow_rejects_noncanonical_decimal(self):
+        http, ws = self.dependencies()
+        http.bodies[1][0]["limitPx"] = "99999.90"
+        with self.assertRaisesRegex(probe.ProbeFailure, "canonical"):
+            probe.run_state_flow(
+                http, "ws://mock/ws", 0.1, probe.DEFAULT_USER,
+                lambda _url, _timeout, _user: ws,
+            )
+
+    def test_mocked_flow_rejects_nonmonotonic_cancel_sequence(self):
+        http, ws = self.dependencies()
+        ws.events[-1]["sequence"] = 1
+        with self.assertRaisesRegex(probe.ProbeFailure, "monotonic"):
+            probe.run_state_flow(
+                http, "ws://mock/ws", 0.1, probe.DEFAULT_USER,
+                lambda _url, _timeout, _user: ws,
+            )
+
+
 class RealOfflineProcessTest(unittest.TestCase):
-    def test_current_offline_binary_passes_probe_a(self):
+    def test_current_offline_binary_passes_probe_b1(self):
         binary = Path(os.environ.get("SIM_SERVER_BIN", ROOT / "target" / "debug" / "sim-server"))
         self.assertTrue(binary.is_file(), f"current binary missing; run cargo build --bin sim-server: {binary}")
         reservation = socket.socket()
@@ -222,8 +338,10 @@ class RealOfflineProcessTest(unittest.TestCase):
             self.assertEqual(len(lines), 1, completed.stdout)
             summary = json.loads(lines[0])
             self.assertEqual(summary["result"], "PASS")
-            self.assertEqual(summary["probe"], "A")
-            self.assertNotIn("matching", summary)
+            self.assertEqual(summary["probe"], "B1")
+            self.assertEqual(summary["counts"], {"placements": 1, "cancels": 1})
+            self.assertIn("placement_update", summary["checks"])
+            self.assertIn("cancel_update", summary["checks"])
         finally:
             if server.poll() is None:
                 server.send_signal(signal.SIGTERM)
