@@ -118,7 +118,7 @@ Tick and lot scales are explicit per asset configuration. Their concrete MVP val
 ### Stable identities and ordering
 
 - `AssetId` is limited to `0..=2` with the fixed mapping above.
-- `SimUserId` is a normalized non-empty local identifier from `X-Sim-User`.
+- `SimUserId` is a normalized 42-character lowercase `0x`-prefixed hexadecimal address-shaped local identifier from `X-Sim-User`. It is a simulator namespace key, not proof of wallet control.
 - `OrderId`, `TradeId`, and `EventSequence` are monotonic integers allocated by the engine.
 - Resting priority is `(price, accepted_sequence)`: highest bid or lowest ask first, then earliest accepted sequence.
 - A batch is evaluated in request order by one engine turn. Every emitted event has one total sequence.

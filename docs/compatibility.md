@@ -13,10 +13,10 @@ Only perpetual BTC, ETH, and SOL are supported, with fixed IDs BTC=0, ETH=1, and
 User-scoped operations require an HTTP/WebSocket upgrade header:
 
 ```text
-X-Sim-User: <local-user-id>
+X-Sim-User: 0x<40 hexadecimal characters>
 ```
 
-The value must be a bounded, normalized, non-empty simulator identifier. It selects local synthetic state. It is not an address and is not derived from a signature.
+The value must be a normalized 42-character lowercase `0x`-prefixed hexadecimal address-shaped simulator identifier. It selects local synthetic state, but it is not proof of wallet control and is not derived from a signature.
 
 Hyperliquid signature-shaped fields may be accepted when they have the documented JSON and string shape. They are syntactic compatibility fields only: the simulator does not recover a signer, verify authority, or trust them for routing. `X-Sim-User` is authoritative for this profile.
 
