@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/hl-wire",
+    "crates/oracle-hyperliquid",
     "crates/sim-core",
     "crates/sim-server",
 ]
@@ -15,6 +16,7 @@ license = "MIT"
 axum = { version = "0.8", features = ["json", "ws"] }
 futures-util = "0.3"
 hl-wire = { path = "crates/hl-wire" }
+oracle-hyperliquid = { path = "crates/oracle-hyperliquid" }
 http-body-util = "0.1"
 serde_json = "1"
 sim-core = { path = "crates/sim-core" }
