@@ -592,6 +592,11 @@ fn runtime_error(error_value: RuntimeError) -> ApiResponse {
         RuntimeError::ShuttingDown | RuntimeError::ReplyDropped => {
             internal("runtime is unavailable")
         }
+        RuntimeError::OracleStale(asset) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCategory::OracleStale,
+            format!("oracle observation is stale for {}", asset.symbol()),
+        ),
     }
 }
 
