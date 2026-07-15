@@ -1,0 +1,68 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 17,
+  "objective": "Amend task 5 so a typed runtime oracle-staleness error can be mapped by the already accepted HTTP adapter without violating the frozen task scope.",
+  "scope": {
+    "write": [
+      "protocol/tasks/5.json"
+    ],
+    "forbidden": [
+      ".github/**",
+      "AGENTS.md",
+      "Cargo.toml",
+      "Cargo.lock",
+      "crates/**",
+      "acceptance/**",
+      "deploy/**",
+      "Dockerfile",
+      "tools/**",
+      "tests/**",
+      "docs/**",
+      "protocol/tasks/1.json",
+      "protocol/tasks/2.json",
+      "protocol/tasks/3.json",
+      "protocol/tasks/4.json",
+      "protocol/tasks/6.json",
+      "protocol/tasks/7.json",
+      "protocol/tasks/10.json",
+      "protocol/tasks/11.json",
+      "protocol/task.schema.json",
+      "protocol/v0.1/**"
+    ]
+  },
+  "inputs": [
+    "protocol/tasks/5.json",
+    "protocol/tasks/3.json",
+    "docs/architecture.md",
+    "docs/compatibility.md"
+  ],
+  "dependencies": [
+    3
+  ],
+  "acceptance": {
+    "commands": [
+      "python3 tools/gpp.py validate-repo",
+      "python3 -m unittest discover -s tests -v",
+      "python3 -m json.tool protocol/tasks/5.json >/dev/null",
+      "git diff --check"
+    ],
+    "assertions": [
+      "Only protocol/tasks/5.json changes.",
+      "Task 5 write scope gains only the HTTP adapter path needed for runtime error compatibility mapping.",
+      "Task 5 acceptance runs the focused HTTP adapter test suite in addition to its existing oracle/runtime/workspace checks.",
+      "Task 5 notes state that HTTP changes are limited to mapping typed runtime oracle errors and associated regression tests.",
+      "No implementation, workflow, validator, schema, or documentation file changes in this amendment."
+    ]
+  },
+  "deliverables": [
+    "Amended task 5 scope for the narrow HTTP runtime-error compatibility mapping",
+    "Amended task 5 acceptance covering the HTTP adapter suite",
+    "Recorded rationale for the parallel shared-seam integration failure"
+  ],
+  "risks": [
+    "Broad HTTP scope could permit unrelated adapter changes unless the task notes and review constrain the amendment.",
+    "Changing a task contract after implementation requires context rematerialization and makes protocol overhead visible.",
+    "Future parallel tasks can repeat this failure if shared public enums are not frozen before adapter fan-out."
+  ],
+  "notes": "Contract-only amendment. PR #14 introduced typed RuntimeError::OracleStale inside task 5's allowed runtime scope, while merged task 3 exhaustively matched the previously frozen enum. The amendment permits only the compatibility mapping and its focused HTTP regression; unrelated HTTP behavior remains out of scope."
+}
