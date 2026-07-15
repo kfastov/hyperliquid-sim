@@ -6,7 +6,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::get;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use hl_wire::SimUserId;
 use hl_wire::api::{Subscription, WsRequest};
 use hl_wire::response::{
@@ -18,13 +18,20 @@ use sim_core::{Event, EventRecord};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::{RuntimeEvent, RuntimeFreshness, RuntimePort};
 
 const SIM_USER_HEADER: &str = "x-sim-user";
+const MIN_OUTBOUND_CAPACITY: usize = 2;
+const SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(1);
+const WRITER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Per-connection resource limits. Both values are normalized to at least one.
+/// Per-connection resource limits.
+///
+/// `outbound_capacity` is normalized to at least two so one subscribe control
+/// can atomically enqueue its acknowledgement and required initial snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WsLimits {
     pub max_subscriptions: usize,
@@ -36,7 +43,11 @@ impl WsLimits {
     pub const fn new(max_subscriptions: usize, outbound_capacity: usize) -> Self {
         Self {
             max_subscriptions: if max_subscriptions == 0 { 1 } else { max_subscriptions },
-            outbound_capacity: if outbound_capacity == 0 { 1 } else { outbound_capacity },
+            outbound_capacity: if outbound_capacity < MIN_OUTBOUND_CAPACITY {
+                MIN_OUTBOUND_CAPACITY
+            } else {
+                outbound_capacity
+            },
         }
     }
 }
@@ -164,7 +175,8 @@ async fn connection(socket: WebSocket, state: AdapterState, identity: Option<Sim
     let (sink, mut incoming) = socket.split();
     let (outbound, outbound_rx) = mpsc::channel(state.limits.outbound_capacity);
     let (disconnect, disconnect_rx) = watch::channel(None);
-    let writer = tokio::spawn(writer(sink, outbound_rx, disconnect_rx));
+    let mut writer_task = tokio::spawn(writer(sink, outbound_rx, disconnect_rx));
+    let mut writer_finished = false;
     let mut runtime_events = state.runtime.subscribe_events();
     let mut subscriptions = HashMap::<SubscriptionKey, ActiveSubscription>::new();
 
@@ -228,11 +240,17 @@ async fn connection(socket: WebSocket, state: AdapterState, identity: Option<Sim
                     }
                 }
             }
+            _ = &mut writer_task => {
+                writer_finished = true;
+                break;
+            },
         }
     }
 
     drop(outbound);
-    let _ = writer.await;
+    if !writer_finished {
+        finish_writer(writer_task, WRITER_JOIN_TIMEOUT).await;
+    }
 }
 
 fn freshness_is_lagged(freshness: RuntimeFreshness) -> bool {
@@ -317,15 +335,22 @@ fn classify_parse_failure(text: &str) -> &'static str {
     };
     match object.get("method").and_then(Value::as_str) {
         Some("post") => "unsupported",
-        Some("subscribe" | "unsubscribe") => match object
-            .get("subscription")
-            .and_then(Value::as_object)
-            .and_then(|subscription| subscription.get("type"))
-            .and_then(Value::as_str)
-        {
-            Some("allMids" | "l2Book" | "trades" | "orderUpdates") | None => "invalid_request",
-            Some(_) => "unsupported",
-        },
+        Some("subscribe" | "unsubscribe") => {
+            let Some(subscription) = object.get("subscription").and_then(Value::as_object) else {
+                return "invalid_request";
+            };
+            match subscription.get("type").and_then(Value::as_str) {
+                Some("l2Book" | "trades")
+                    if object.len() == 2
+                        && subscription.len() == 2
+                        && subscription.get("coin").and_then(Value::as_str).is_some() =>
+                {
+                    "unsupported"
+                }
+                Some("allMids" | "l2Book" | "trades" | "orderUpdates") | None => "invalid_request",
+                Some(_) => "unsupported",
+            }
+        }
         Some(method) if !matches!(method, "ping" | "subscribe" | "unsubscribe") => "unsupported",
         _ => "invalid_request",
     }
@@ -431,11 +456,24 @@ fn signal_disconnect(
     disconnect.send_replace(Some(DisconnectNotice { category, message }));
 }
 
-async fn writer(
-    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+async fn writer<S>(
+    mut sink: S,
     mut outbound: mpsc::Receiver<Message>,
     mut disconnect: watch::Receiver<Option<DisconnectNotice>>,
-) {
+) where
+    S: Sink<Message> + Unpin,
+{
+    writer_with_timeout(&mut sink, &mut outbound, &mut disconnect, SOCKET_SEND_TIMEOUT).await;
+}
+
+async fn writer_with_timeout<S>(
+    sink: &mut S,
+    outbound: &mut mpsc::Receiver<Message>,
+    disconnect: &mut watch::Receiver<Option<DisconnectNotice>>,
+    send_timeout: Duration,
+) where
+    S: Sink<Message> + Unpin,
+{
     loop {
         tokio::select! {
             biased;
@@ -445,21 +483,23 @@ async fn writer(
                 }
                 let notice = disconnect.borrow_and_update().clone();
                 if let Some(notice) = notice {
-                    let _ = sink.send(Message::Text(json!({
+                    if send_to_socket(sink, Message::Text(json!({
                         "channel": "error",
                         "data": {"category": notice.category, "message": notice.message},
-                    }).to_string().into())).await;
-                    let _ = sink.send(Message::Close(Some(CloseFrame {
+                    }).to_string().into()), send_timeout).await.is_err() {
+                        break;
+                    }
+                    let _ = send_to_socket(sink, Message::Close(Some(CloseFrame {
                         code: 1013,
                         reason: "resubscribe required".into(),
-                    }))).await;
+                    })), send_timeout).await;
                     break;
                 }
             }
             message = outbound.recv() => {
                 match message {
                     Some(message) => {
-                        if sink.send(message).await.is_err() {
+                        if send_to_socket(sink, message, send_timeout).await.is_err() {
                             break;
                         }
                     }
@@ -467,5 +507,90 @@ async fn writer(
                 }
             }
         }
+    }
+}
+
+async fn send_to_socket<S>(sink: &mut S, message: Message, timeout: Duration) -> Result<(), ()>
+where
+    S: Sink<Message> + Unpin,
+{
+    tokio::time::timeout(timeout, sink.send(message)).await.map_err(|_| ())?.map_err(|_| ())
+}
+
+async fn finish_writer(mut writer: tokio::task::JoinHandle<()>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut writer).await.is_err() {
+        writer.abort();
+        let _ = writer.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    struct BlockedSink;
+
+    impl Sink<Message> for BlockedSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_socket_send_terminates_writer_at_injected_timeout() {
+        let (outbound, mut outbound_rx) = mpsc::channel(2);
+        let (_disconnect, mut disconnect_rx) = watch::channel(None);
+        outbound.try_send(Message::Text("blocked".into())).unwrap();
+        let mut sink = BlockedSink;
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            writer_with_timeout(
+                &mut sink,
+                &mut outbound_rx,
+                &mut disconnect_rx,
+                Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("writer must stop after the socket-send deadline");
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_join_deadline_aborts_stuck_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(Arc::clone(&dropped));
+        let task = tokio::spawn(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+
+        finish_writer(task, Duration::from_millis(10)).await;
+        assert!(dropped.load(Ordering::SeqCst), "timed-out writer must be cancelled");
     }
 }

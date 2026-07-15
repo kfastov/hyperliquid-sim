@@ -2,9 +2,9 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use hl_wire::api::Subscription;
 use hl_wire::response::EventChannel;
-use hl_wire::{AssetId, SimUserId};
+use hl_wire::{AssetId, PriceTicks, QtyLots, SimUserId};
 use serde_json::{Value, json};
-use sim_core::{Event, EventRecord, OrderState};
+use sim_core::{Event, EventRecord, Fill, OrderSnapshot, OrderState, Side, TimeInForce};
 use sim_server::ws::{SnapshotView, ViewError, ViewMessage, WsLimits, router};
 use sim_server::{
     PendingRuntimeReply, RuntimeError, RuntimeEvent, RuntimeFreshness, RuntimePort, RuntimeRequest,
@@ -102,7 +102,11 @@ impl SnapshotView for FakeView {
             {
                 Some(ViewMessage::new(EventChannel::Trades, record.sequence, json!([])))
             }
-            Subscription::OrderUpdates { user } if event_user == Some(user) => {
+            // Deliberately project every order event. The adapter, rather than a
+            // view implementation, owns the user-isolation boundary.
+            Subscription::OrderUpdates { .. }
+                if event_user.is_some() || matches!(record.event, Event::Fill { .. }) =>
+            {
                 Some(ViewMessage::new(
                     EventChannel::OrderUpdates,
                     record.sequence,
@@ -187,6 +191,36 @@ async fn unsupported_post_and_subscription_variants_fail_explicitly() {
         .await
         .unwrap();
     assert_eq!(receive_json(&mut socket).await["data"]["category"], "unsupported");
+
+    for request in [
+        r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"DOGE"}}"#,
+        r#"{"method":"subscribe","subscription":{"type":"trades","coin":"DOGE"}}"#,
+    ] {
+        socket.send(Message::text(request)).await.unwrap();
+        assert_eq!(receive_json(&mut socket).await["data"]["category"], "unsupported");
+    }
+
+    for request in [
+        r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":7}}"#,
+        r#"{"method":"subscribe","subscription":{"type":"trades"}}"#,
+        r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"DOGE","extra":true}}"#,
+    ] {
+        socket.send(Message::text(request)).await.unwrap();
+        assert_eq!(receive_json(&mut socket).await["data"]["category"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn minimum_outbound_capacity_carries_subscribe_ack_and_snapshot() {
+    let url = spawn(FakeRuntime::new(16), WsLimits::new(8, 1)).await;
+    let (mut socket, _) = connect_async(&url).await.unwrap();
+    socket
+        .send(Message::text(r#"{"method":"subscribe","subscription":{"type":"allMids"}}"#))
+        .await
+        .unwrap();
+
+    assert_eq!(receive_json(&mut socket).await["data"]["method"], "subscribe");
+    assert_eq!(receive_json(&mut socket).await["channel"], "allMids");
 }
 
 #[tokio::test]
@@ -226,6 +260,87 @@ async fn order_updates_require_matching_upgrade_identity_and_do_not_leak() {
     });
     assert_eq!(receive_json(&mut a).await["sequence"], 11);
     assert!(tokio::time::timeout(Duration::from_millis(150), b.next()).await.is_err());
+}
+
+#[tokio::test]
+async fn order_update_routing_covers_all_owned_event_roles() {
+    let runtime = FakeRuntime::new(32);
+    let url = spawn(runtime.clone(), WsLimits::default()).await;
+    let request_a =
+        ClientRequestBuilder::new(url.parse().unwrap()).with_header("X-Sim-User", USER_A);
+    let request_b =
+        ClientRequestBuilder::new(url.parse().unwrap()).with_header("X-Sim-User", USER_B);
+    let (mut a, _) = connect_async(request_a).await.unwrap();
+    let (mut b, _) = connect_async(request_b).await.unwrap();
+    for (socket, user) in [(&mut a, USER_A), (&mut b, USER_B)] {
+        socket
+            .send(Message::text(format!(
+                r#"{{"method":"subscribe","subscription":{{"type":"orderUpdates","user":"{user}"}}}}"#
+            )))
+            .await
+            .unwrap();
+        let _ = receive_json(socket).await;
+        let _ = receive_json(socket).await;
+    }
+
+    let user_a = SimUserId::parse(USER_A).unwrap();
+    let user_b = SimUserId::parse(USER_B).unwrap();
+    let owned_events = [
+        Event::OrderAccepted {
+            order: OrderSnapshot {
+                id: 1,
+                user: user_a.clone(),
+                asset: AssetId::BTC,
+                side: Side::Bid,
+                price: PriceTicks::new(100).unwrap(),
+                quantity: QtyLots::new(2).unwrap(),
+                remaining_lots: 2,
+                time_in_force: TimeInForce::Gtc,
+                client_order_id: None,
+                accepted_sequence: 11,
+                state: OrderState::Open,
+            },
+        },
+        Event::OrderUpdated {
+            order_id: 1,
+            user: user_a.clone(),
+            asset: AssetId::BTC,
+            remaining_lots: 1,
+            state: OrderState::Open,
+        },
+        Event::OrderCancelled {
+            order_id: 1,
+            user: user_a.clone(),
+            asset: AssetId::BTC,
+            cancelled_lots: 1,
+        },
+    ];
+    for (index, event) in owned_events.into_iter().enumerate() {
+        let sequence = 11 + u64::try_from(index).unwrap();
+        runtime.publish(EventRecord { sequence, timestamp: 1000 + sequence, event });
+        assert_eq!(receive_json(&mut a).await["sequence"], sequence);
+        assert!(tokio::time::timeout(Duration::from_millis(100), b.next()).await.is_err());
+    }
+
+    runtime.publish(EventRecord {
+        sequence: 14,
+        timestamp: 1014,
+        event: Event::Fill {
+            fill: Fill {
+                trade_id: 1,
+                asset: AssetId::BTC,
+                price: PriceTicks::new(100).unwrap(),
+                quantity_lots: 1,
+                maker_order_id: 1,
+                taker_order_id: 2,
+                maker: user_a,
+                taker: user_b,
+                taker_side: Side::Ask,
+            },
+        },
+    });
+    assert_eq!(receive_json(&mut a).await["sequence"], 14, "maker must receive fill");
+    assert_eq!(receive_json(&mut b).await["sequence"], 14, "taker must receive fill");
 }
 
 #[tokio::test]
