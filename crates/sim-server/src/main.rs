@@ -1,5 +1,6 @@
 mod config;
 
+use axum::{Json, Router, http::StatusCode, routing::get};
 use config::{Config, OracleMode};
 use hl_wire::{AssetId, DecimalScale, PriceTicks};
 use oracle_hyperliquid::{
@@ -12,12 +13,15 @@ use sim_server::runtime::{RuntimeTask, RuntimeTaskError, start_runtime};
 use sim_server::{
     RuntimeError, RuntimeHandle, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
 };
-use std::{fmt, process::ExitCode, sync::Arc, time::Duration};
+use std::{fmt, io, process::ExitCode, sync::Arc, time::Duration};
 use tokio::{
-    sync::{mpsc, watch},
+    net::TcpListener,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 const LIVE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LIVE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +42,7 @@ impl OracleCacheSnapshot {
         Self { latest: [None; 3], upstream_available: [false; 3], synthetic }
     }
 
+    #[cfg(test)]
     fn all_upstream_available(self) -> bool {
         self.upstream_available.into_iter().all(|available| available)
     }
@@ -72,6 +77,7 @@ impl LifecycleState {
         self.oracle_cache.send_modify(|cache| cache.upstream_available[asset_index(asset)] = false);
     }
 
+    #[cfg(test)]
     async fn wait_for_all_upstream(&self, bound: Duration) -> bool {
         let mut cache = self.oracle_cache.subscribe();
         if cache.borrow().all_upstream_available() {
@@ -90,6 +96,17 @@ impl LifecycleState {
         .await
         .unwrap_or(false)
     }
+}
+
+async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+}
+
+fn service_router(config: &Config) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, config.reply_timeout))
+        .layer(ConcurrencyLimitLayer::new(config.max_concurrent_requests.get()))
 }
 
 #[derive(Clone, Debug)]
@@ -129,6 +146,9 @@ enum LifecycleError {
     IngestionTaskFailed,
     IngestionTaskTimedOut,
     RuntimeTask(RuntimeTaskError),
+    Listener(io::Error),
+    ListenerTaskFailed,
+    ListenerTaskTimedOut,
     Signal(std::io::Error),
 }
 
@@ -145,6 +165,11 @@ impl fmt::Display for LifecycleError {
                 formatter.write_str("oracle ingestion did not stop within its bound")
             }
             Self::RuntimeTask(error) => write!(formatter, "runtime owner failed: {error}"),
+            Self::Listener(error) => write!(formatter, "listener failed: {error}"),
+            Self::ListenerTaskFailed => formatter.write_str("listener task failed"),
+            Self::ListenerTaskTimedOut => {
+                formatter.write_str("listener did not stop within its bound")
+            }
             Self::Signal(error) => write!(formatter, "shutdown signal handler failed: {error}"),
         }
     }
@@ -156,23 +181,44 @@ struct ServiceLifecycle {
     runtime_task: RuntimeTask,
     cancel: watch::Sender<bool>,
     ingestion_task: JoinHandle<Result<(), LifecycleError>>,
+    listener_task: Option<JoinHandle<Result<(), io::Error>>>,
     reply_timeout: Duration,
     shutdown_timeout: Duration,
 }
 
 impl ServiceLifecycle {
+    fn attach_listener(&mut self, task: JoinHandle<Result<(), io::Error>>) {
+        self.listener_task = Some(task);
+    }
+
     async fn shutdown(self) -> Result<(), LifecycleError> {
         let Self {
             runtime,
             runtime_task,
             cancel,
             mut ingestion_task,
+            listener_task,
             reply_timeout,
             shutdown_timeout,
             ..
         } = self;
 
         let _ = cancel.send(true);
+        // Release the listening socket before beginning the bounded shutdown of
+        // ingestion and the single runtime owner.
+        let listener_result = if let Some(mut listener_task) = listener_task {
+            match tokio::time::timeout(shutdown_timeout, &mut listener_task).await {
+                Ok(Ok(result)) => result.map_err(LifecycleError::Listener),
+                Ok(Err(_)) => Err(LifecycleError::ListenerTaskFailed),
+                Err(_) => {
+                    listener_task.abort();
+                    let _ = listener_task.await;
+                    Err(LifecycleError::ListenerTaskTimedOut)
+                }
+            }
+        } else {
+            Ok(())
+        };
         let ingestion_result =
             match tokio::time::timeout(shutdown_timeout, &mut ingestion_task).await {
                 Ok(Ok(result)) => result,
@@ -198,6 +244,7 @@ impl ServiceLifecycle {
         let owner_result =
             runtime_task.wait(shutdown_timeout).await.map_err(LifecycleError::RuntimeTask);
 
+        listener_result?;
         ingestion_result?;
         shutdown_result?;
         owner_result
@@ -251,6 +298,7 @@ fn start_lifecycle(config: &Config) -> ServiceLifecycle {
         runtime_task,
         cancel,
         ingestion_task,
+        listener_task: None,
         reply_timeout: config.reply_timeout,
         shutdown_timeout: config.shutdown_timeout,
     }
@@ -494,20 +542,59 @@ async fn main() -> ExitCode {
     };
     println!("{}", config.validation_summary());
 
-    let lifecycle = start_lifecycle(&config);
-    let upstream_available = lifecycle.state.wait_for_all_upstream(config.reply_timeout).await;
+    let listener = match TcpListener::bind(config.bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("sim-server listener bind failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let local_addr = match listener.local_addr() {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("sim-server listener address failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut lifecycle = start_lifecycle(&config);
+    let mut listener_cancel = lifecycle.cancel.subscribe();
+    let (listener_done, listener_stopped) = oneshot::channel();
+    let listener_task = tokio::spawn(async move {
+        let result = axum::serve(listener, service_router(&config))
+            .with_graceful_shutdown(async move {
+                if *listener_cancel.borrow() {
+                    return;
+                }
+                while listener_cancel.changed().await.is_ok() {
+                    if *listener_cancel.borrow() {
+                        return;
+                    }
+                }
+            })
+            .await;
+        let _ = listener_done.send(());
+        result
+    });
+    lifecycle.attach_listener(listener_task);
     println!(
-        "sim-server readiness: lifecycle=running upstream_available={} synthetic={} assets=BTC,ETH,SOL listener=disabled",
-        upstream_available,
+        "sim-server readiness: lifecycle=running synthetic={} assets=BTC,ETH,SOL listener={local_addr}",
         lifecycle.state.snapshot().synthetic,
     );
 
-    if let Err(error) = wait_for_shutdown_signal().await {
+    let trigger_result = tokio::select! {
+        result = wait_for_shutdown_signal() => result,
+        _ = listener_stopped => Err(LifecycleError::ListenerTaskFailed),
+    };
+    let shutdown_result = lifecycle.shutdown().await;
+    if let Err(error) = trigger_result {
         eprintln!("sim-server lifecycle failed: {error}");
-        let _ = lifecycle.shutdown().await;
+        if let Err(shutdown_error) = shutdown_result {
+            eprintln!("sim-server shutdown failed: {shutdown_error}");
+        }
         return ExitCode::FAILURE;
     }
-    match lifecycle.shutdown().await {
+    match shutdown_result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("sim-server shutdown failed: {error}");
