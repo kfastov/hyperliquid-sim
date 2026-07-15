@@ -38,22 +38,26 @@ fn server_command(address: SocketAddr) -> Command {
     command
 }
 
-fn wait_for_health(address: SocketAddr) -> String {
+fn wait_for_response(address: SocketAddr, path: &str, expected_status: &str) -> String {
     let deadline = Instant::now() + PROCESS_BOUND;
     loop {
         match TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             Ok(mut stream) => {
-                stream
-                    .write_all(
-                        b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    )
-                    .expect("write health request");
+                write!(
+                    stream,
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write HTTP request");
                 let mut response = String::new();
-                stream.read_to_string(&mut response).expect("read health response");
-                return response;
+                stream.read_to_string(&mut response).expect("read HTTP response");
+                if response.starts_with(expected_status) {
+                    return response;
+                }
+                assert!(Instant::now() < deadline, "unexpected response: {response}");
+                thread::sleep(Duration::from_millis(20));
             }
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Err(error) => panic!("health listener did not start: {error}"),
+            Err(error) => panic!("HTTP listener did not start: {error}"),
         }
     }
 }
@@ -83,9 +87,10 @@ fn health_sigterm_zero_exit_and_port_reuse() {
         .expect("spawn server");
     let mut child = ChildGuard(child);
 
-    let response = wait_for_health(address);
-    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    let response = wait_for_response(address, "/healthz", "HTTP/1.1 200 OK\r\n");
     assert!(response.ends_with("\r\n\r\n{\"status\":\"alive\"}"), "{response}");
+    let response = wait_for_response(address, "/readyz", "HTTP/1.1 200 OK\r\n");
+    assert!(response.ends_with("\r\n\r\n{\"status\":\"ready\"}"), "{response}");
 
     let signal = Command::new("kill")
         .args(["-TERM", &child.0.id().to_string()])

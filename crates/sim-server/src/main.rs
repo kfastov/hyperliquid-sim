@@ -1,6 +1,6 @@
 mod config;
 
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use config::{Config, OracleMode};
 use hl_wire::{AssetId, DecimalScale, PriceTicks};
 use oracle_hyperliquid::{
@@ -8,7 +8,9 @@ use oracle_hyperliquid::{
     OracleOrchestrator, PriceScales, ReconnectBackoff, SystemClock, TokioHyperliquidTransport,
     TokioSleeper, TransportFactory,
 };
+use sim_server::http::{MarketObservation, MarketSnapshot, MarketView, MarketViewError};
 use sim_server::runtime::actors::SeededLocalActors;
+use sim_server::runtime::{OracleAssetHealth, RuntimeOracleHealth};
 use sim_server::runtime::{RuntimeTask, RuntimeTaskError, start_runtime};
 use sim_server::{
     RuntimeError, RuntimeHandle, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
@@ -29,17 +31,19 @@ const LIVE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const LIVE_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
 const LIVE_RECONNECT_MAXIMUM: Duration = Duration::from_secs(5);
+const MAX_OBSERVATION_AGE_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OracleCacheSnapshot {
     latest: [Option<OracleObservation>; 3],
     upstream_available: [bool; 3],
+    consistent: [bool; 3],
     synthetic: bool,
 }
 
 impl OracleCacheSnapshot {
     const fn empty(synthetic: bool) -> Self {
-        Self { latest: [None; 3], upstream_available: [false; 3], synthetic }
+        Self { latest: [None; 3], upstream_available: [false; 3], consistent: [true; 3], synthetic }
     }
 
     #[cfg(test)]
@@ -68,8 +72,17 @@ impl LifecycleState {
     fn observe(&self, observation: OracleObservation) {
         self.oracle_cache.send_modify(|cache| {
             let index = asset_index(observation.asset);
+            if cache.latest[index].is_some_and(|previous| {
+                observation.upstream_sequence <= previous.upstream_sequence
+                    || observation.observed_at_ms < previous.observed_at_ms
+            }) {
+                cache.consistent[index] = false;
+                cache.upstream_available[index] = true;
+                return;
+            }
             cache.latest[index] = Some(observation);
             cache.upstream_available[index] = true;
+            cache.consistent[index] = true;
         });
     }
 
@@ -98,13 +111,123 @@ impl LifecycleState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct LifecycleMarketView {
+    state: Arc<LifecycleState>,
+}
+
+impl LifecycleMarketView {
+    fn new(state: Arc<LifecycleState>) -> Self {
+        Self { state }
+    }
+}
+
+impl MarketView for LifecycleMarketView {
+    fn snapshot(&self) -> Result<MarketSnapshot, MarketViewError> {
+        // One wall-clock read makes this projection atomic across all assets.
+        let captured_at = SystemClock.now_ms();
+        project_market_snapshot(self.state.snapshot(), captured_at)
+    }
+}
+
+fn project_market_snapshot(
+    cache: OracleCacheSnapshot,
+    captured_at: u64,
+) -> Result<MarketSnapshot, MarketViewError> {
+    let observations = AssetId::ALL
+        .into_iter()
+        .map(|asset| {
+            let index = asset_index(asset);
+            if !cache.consistent[index] {
+                return Err(MarketViewError::InvalidSnapshot);
+            }
+            let observation = cache.latest[index].ok_or(MarketViewError::Unavailable)?;
+            if observation.asset != asset {
+                return Err(MarketViewError::InvalidSnapshot);
+            }
+            let age_ms = captured_at
+                .checked_sub(observation.observed_at_ms)
+                .ok_or(MarketViewError::InvalidSnapshot)?;
+            Ok(MarketObservation {
+                asset,
+                oracle_price: observation.price,
+                observed_at: observation.observed_at_ms,
+                // Availability is immediate cache state. Timestamp freshness is
+                // recomputed locally; no upstream stale classification is trusted.
+                is_stale: !cache.upstream_available[index] || age_ms > MAX_OBSERVATION_AGE_MS,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MarketSnapshot { captured_at, observations })
+}
+
 async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
 }
 
-fn service_router(config: &Config) -> Router {
+#[derive(Clone)]
+struct ReadinessState {
+    runtime: Arc<dyn RuntimePort>,
+    market: Arc<dyn MarketView>,
+    reply_timeout: Duration,
+}
+
+async fn readyz(State(state): State<ReadinessState>) -> (StatusCode, Json<serde_json::Value>) {
+    let runtime_ready = runtime_oracle_ready(&*state.runtime, state.reply_timeout).await;
+    let local_ready = state.market.snapshot().is_ok_and(|snapshot| {
+        snapshot.observations.len() == AssetId::ALL.len()
+            && AssetId::ALL.into_iter().all(|asset| {
+                snapshot
+                    .observations
+                    .iter()
+                    .any(|observation| observation.asset == asset && !observation.is_stale)
+            })
+    });
+    if runtime_ready && local_ready {
+        (StatusCode::OK, Json(serde_json::json!({"status": "ready"})))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"status": "not_ready"})))
+    }
+}
+
+async fn runtime_oracle_ready(runtime: &dyn RuntimePort, bound: Duration) -> bool {
+    let Ok(pending) = runtime.try_request(RuntimeRequest::OracleHealth) else {
+        return false;
+    };
+    let Ok(Ok(RuntimeReply::OracleHealth(health))) =
+        tokio::time::timeout(bound, pending.receive()).await
+    else {
+        return false;
+    };
+    oracle_health_is_ready(health)
+}
+
+fn oracle_health_is_ready(health: RuntimeOracleHealth) -> bool {
+    health.assets.into_iter().zip(AssetId::ALL).all(|(entry, expected)| {
+        matches!(
+            entry,
+            OracleAssetHealth::Observed {
+                asset,
+                freshness: oracle_hyperliquid::OracleFreshness::Fresh { age_ms },
+                ..
+            } if asset == expected && age_ms <= MAX_OBSERVATION_AGE_MS
+        )
+    })
+}
+
+fn service_router(
+    config: &Config,
+    runtime: Arc<dyn RuntimePort>,
+    market: Arc<dyn MarketView>,
+) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(ReadinessState {
+            runtime,
+            market,
+            reply_timeout: (config.reply_timeout / 2).max(Duration::from_millis(1)),
+        })
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, config.reply_timeout))
         .layer(ConcurrencyLimitLayer::new(config.max_concurrent_requests.get()))
 }
@@ -560,8 +683,11 @@ async fn main() -> ExitCode {
     let mut lifecycle = start_lifecycle(&config);
     let mut listener_cancel = lifecycle.cancel.subscribe();
     let (listener_done, listener_stopped) = oneshot::channel();
+    let router_runtime: Arc<dyn RuntimePort> = Arc::new(lifecycle.runtime.clone());
+    let router_market: Arc<dyn MarketView> =
+        Arc::new(LifecycleMarketView::new(lifecycle.state.clone()));
     let listener_task = tokio::spawn(async move {
-        let result = axum::serve(listener, service_router(&config))
+        let result = axum::serve(listener, service_router(&config, router_runtime, router_market))
             .with_graceful_shutdown(async move {
                 if *listener_cancel.borrow() {
                     return;
@@ -606,11 +732,14 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
     use oracle_hyperliquid::{OracleFreshness, OracleTransport};
     use sim_core::Engine;
-    use sim_server::runtime::OracleAssetHealth;
+    use sim_server::runtime::{OracleAssetHealth, RuntimeOracleHealth};
     use sim_server::{RuntimeReply, bounded_runtime};
     use std::{num::NonZeroUsize, sync::Mutex};
+    use tower::ServiceExt;
 
     fn test_config(actors_enabled: bool) -> Config {
         Config::from_pairs(&[
@@ -737,6 +866,189 @@ mod tests {
             let _ = runtime_request(&runtime, RuntimeRequest::Shutdown).await;
             owner_task.await.expect("test owner exits");
         }
+    }
+
+    fn cache_with_observations(observed_at_ms: u64) -> OracleCacheSnapshot {
+        let mut cache = OracleCacheSnapshot::empty(false);
+        cache.latest = synthetic_observations(observed_at_ms, 1).map(Some);
+        cache.upstream_available = [true; 3];
+        cache
+    }
+
+    #[test]
+    fn market_projection_is_fresh_at_60_000_ms_and_stale_at_60_001_ms() {
+        for (age_ms, expected_stale) in [(60_000, false), (60_001, true)] {
+            let snapshot = project_market_snapshot(cache_with_observations(10), 10 + age_ms)
+                .expect("complete cache projects");
+            assert_eq!(snapshot.captured_at, 10 + age_ms);
+            assert_eq!(
+                snapshot.observations.iter().map(|item| item.asset).collect::<Vec<_>>(),
+                AssetId::ALL
+            );
+            assert!(
+                snapshot.observations.iter().all(|item| item.is_stale == expected_stale),
+                "age_ms={age_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn market_projection_fails_closed_on_future_and_missing_cache_state() {
+        assert_eq!(
+            project_market_snapshot(cache_with_observations(11), 10),
+            Err(MarketViewError::InvalidSnapshot)
+        );
+        assert_eq!(
+            project_market_snapshot(OracleCacheSnapshot::empty(false), 10),
+            Err(MarketViewError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn market_projection_fails_closed_after_regressed_cache_input() {
+        let state = LifecycleState::new(false);
+        for observation in synthetic_observations(10, 2) {
+            state.observe(observation);
+        }
+        state.observe(synthetic_observation(AssetId::BTC, 2_000_000, 9, 1));
+        assert_eq!(
+            project_market_snapshot(state.snapshot(), 10),
+            Err(MarketViewError::InvalidSnapshot)
+        );
+    }
+
+    #[test]
+    fn unavailable_cache_state_immediately_marks_retained_observation_stale() {
+        let state = LifecycleState::new(false);
+        for observation in synthetic_observations(10, 1) {
+            state.observe(observation);
+        }
+        state.unavailable(AssetId::BTC);
+        let snapshot =
+            project_market_snapshot(state.snapshot(), 10).expect("retained prices project");
+        assert!(snapshot.observations[0].is_stale);
+        assert!(!snapshot.observations[1].is_stale);
+        assert!(!snapshot.observations[2].is_stale);
+    }
+
+    fn fresh_runtime_health() -> RuntimeOracleHealth {
+        RuntimeOracleHealth {
+            assets: AssetId::ALL.map(|asset| OracleAssetHealth::Observed {
+                asset,
+                source: ObservationSource::MetaAndAssetCtxs,
+                upstream_sequence: 1,
+                observed_at_ms: 1,
+                freshness: OracleFreshness::Fresh { age_ms: 0 },
+            }),
+        }
+    }
+
+    async fn readiness_response(router: Router) -> (StatusCode, String) {
+        let response = router
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .expect("readiness response");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("readiness body").to_bytes();
+        (status, String::from_utf8(body.to_vec()).expect("utf8 readiness body"))
+    }
+
+    #[tokio::test]
+    async fn readiness_transitions_from_503_to_200_when_local_cache_completes() {
+        let limits = RuntimeLimits::new(NonZeroUsize::new(8).unwrap(), NonZeroUsize::MIN);
+        let (runtime, mut owner, _) = bounded_runtime(limits);
+        let owner_task = tokio::spawn(async move {
+            while let Some(envelope) = owner.recv().await {
+                assert_eq!(envelope.request, RuntimeRequest::OracleHealth);
+                let _ = envelope.respond(Ok(RuntimeReply::OracleHealth(fresh_runtime_health())));
+            }
+        });
+        let state = LifecycleState::new(false);
+        let config = test_config(false);
+        let router = service_router(
+            &config,
+            Arc::new(runtime.clone()),
+            Arc::new(LifecycleMarketView::new(state.clone())),
+        );
+
+        assert_eq!(
+            readiness_response(router.clone()).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())
+        );
+        let observed_at_ms = SystemClock.now_ms();
+        for observation in synthetic_observations(observed_at_ms, 1) {
+            state.observe(observation);
+        }
+        assert_eq!(
+            readiness_response(router).await,
+            (StatusCode::OK, "{\"status\":\"ready\"}".to_owned())
+        );
+        drop(runtime);
+        owner_task.await.expect("readiness owner exits");
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_stable_503_when_runtime_is_shutting_down() {
+        let limits = RuntimeLimits::new(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let (runtime, owner, _) = bounded_runtime(limits);
+        drop(owner);
+        let state = LifecycleState::new(false);
+        let observed_at_ms = SystemClock.now_ms();
+        for observation in synthetic_observations(observed_at_ms, 1) {
+            state.observe(observation);
+        }
+        let response = readiness_response(service_router(
+            &test_config(false),
+            Arc::new(runtime),
+            Arc::new(LifecycleMarketView::new(state)),
+        ))
+        .await;
+        assert_eq!(
+            response,
+            (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_stable_503_for_runtime_overload_and_timeout() {
+        let config = Config::from_pairs(&[("SIM_REPLY_TIMEOUT_MS", "20")]).unwrap();
+
+        let limits = RuntimeLimits::new(NonZeroUsize::MIN, NonZeroUsize::MIN);
+        let (overloaded_runtime, overloaded_owner, _) = bounded_runtime(limits);
+        let _occupied = overloaded_runtime
+            .try_request(RuntimeRequest::EngineSnapshot)
+            .expect("fill runtime queue");
+        let overloaded_state = LifecycleState::new(false);
+        let now = SystemClock.now_ms();
+        for observation in synthetic_observations(now, 1) {
+            overloaded_state.observe(observation);
+        }
+        assert_eq!(
+            readiness_response(service_router(
+                &config,
+                Arc::new(overloaded_runtime),
+                Arc::new(LifecycleMarketView::new(overloaded_state)),
+            ))
+            .await,
+            (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())
+        );
+        drop(overloaded_owner);
+
+        let (timed_out_runtime, timed_out_owner, _) = bounded_runtime(limits);
+        let timed_out_state = LifecycleState::new(false);
+        for observation in synthetic_observations(SystemClock.now_ms(), 1) {
+            timed_out_state.observe(observation);
+        }
+        assert_eq!(
+            readiness_response(service_router(
+                &config,
+                Arc::new(timed_out_runtime),
+                Arc::new(LifecycleMarketView::new(timed_out_state)),
+            ))
+            .await,
+            (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())
+        );
+        drop(timed_out_owner);
     }
 
     #[test]
