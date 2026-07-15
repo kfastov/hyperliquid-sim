@@ -3,7 +3,7 @@
 //! Decimal strings are converted exactly to integer ticks/lots. This crate has
 //! no exchange state and performs no identity inference or network activity.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
 
@@ -65,7 +65,7 @@ impl FromStr for AssetId {
 }
 
 /// Number of decimal places represented by one integer unit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct DecimalScale(u8);
 
 impl DecimalScale {
@@ -84,8 +84,20 @@ impl DecimalScale {
     }
 }
 
+impl<'de> Deserialize<'de> for DecimalScale {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u8::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 /// A strictly positive exact price in configured ticks.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+///
+/// Serde intentionally uses the internal integer tick representation. Wire
+/// adapters that accept decimal strings must parse them with [`PriceTicks::parse`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct PriceTicks(i64);
 
 impl PriceTicks {
@@ -110,8 +122,20 @@ impl PriceTicks {
     }
 }
 
+impl<'de> Deserialize<'de> for PriceTicks {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(i64::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 /// A strictly positive exact quantity in configured lots.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+///
+/// Serde intentionally uses the internal integer lot representation. Wire
+/// adapters that accept decimal strings must parse them with [`QtyLots::parse`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct QtyLots(u64);
 
 impl QtyLots {
@@ -136,8 +160,17 @@ impl QtyLots {
     }
 }
 
+impl<'de> Deserialize<'de> for QtyLots {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(u64::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 /// Normalized address-shaped identifier for synthetic local state.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SimUserId(String);
 
@@ -157,6 +190,15 @@ impl SimUserId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SimUserId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(&String::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 
@@ -202,6 +244,9 @@ fn parse_scaled(value: &str, scale: DecimalScale, signed: bool) -> Result<i128, 
         Some(_) => return Err(WireValueError::InvalidDecimal),
         None => (false, value),
     };
+    if unsigned.ends_with('.') {
+        return Err(WireValueError::InvalidDecimal);
+    }
     let mut pieces = unsigned.split('.');
     let whole = pieces.next().ok_or(WireValueError::InvalidDecimal)?;
     let fraction = pieces.next().unwrap_or("");
