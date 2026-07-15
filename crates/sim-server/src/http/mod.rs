@@ -4,7 +4,7 @@ use crate::{RuntimeError, RuntimePort, RuntimeReply, RuntimeRequest};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, State, rejection::BytesRejection},
     http::{HeaderMap, StatusCode},
     routing::post,
 };
@@ -87,7 +87,15 @@ pub fn router_with_config(
         .with_state(AppState { runtime, market, config })
 }
 
-async fn info(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResponse {
+async fn info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResponse {
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return invalid("request body exceeds the configured limit"),
+    };
     let value = match decode_json(&body) {
         Ok(value) => value,
         Err(response) => return response,
@@ -173,10 +181,18 @@ async fn info(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
     }
 }
 
-async fn exchange(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResponse {
+async fn exchange(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> ApiResponse {
     let user = match authority(&headers) {
         Ok(user) => user,
         Err(response) => return response,
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(_) => return invalid("request body exceeds the configured limit"),
     };
     let value = match decode_json(&body) {
         Ok(value) => value,
@@ -427,7 +443,14 @@ fn observation(snapshot: &MarketSnapshot, asset: AssetId) -> Option<&MarketObser
 }
 
 fn market_snapshot(state: &AppState) -> Result<MarketSnapshot, ApiResponse> {
-    state.market.snapshot().map_err(|_| internal("market view is unavailable"))
+    let snapshot = state.market.snapshot().map_err(|_| internal("market view is unavailable"))?;
+    let complete_and_unique = AssetId::ALL.into_iter().all(|asset| {
+        snapshot.observations.iter().filter(|entry| entry.asset == asset).count() == 1
+    }) && snapshot.observations.len() == AssetId::ALL.len();
+    if !complete_and_unique {
+        return Err(internal("market snapshot is invalid"));
+    }
+    Ok(snapshot)
 }
 
 async fn runtime_request(
