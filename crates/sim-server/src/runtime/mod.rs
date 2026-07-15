@@ -1,9 +1,11 @@
-//! Typed, bounded boundary around the future single-owner engine runtime.
+//! Typed, bounded boundary around the single-owner engine runtime.
 //!
-//! This module deliberately defines channels and messages only. Task #5 owns
-//! the loop that receives [`RuntimeEnvelope`] values and mutates the engine.
+//! Every adapter and local actor reaches the engine through [`RuntimePort`].
+
+pub mod actors;
 
 use hl_wire::{AssetId, SimUserId};
+use oracle_hyperliquid::{ObservationReject, OracleFreshness, OracleObservation, OracleState};
 use sim_core::{
     AccountSnapshot, ApplyResult, BookSnapshot, Command, Engine, EngineSnapshot, EventRecord,
     EventSequence, OrderId, OrderSnapshot,
@@ -28,6 +30,7 @@ impl RuntimeLimits {
 /// Commands and read-only queries accepted by the engine owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeRequest {
+    ObserveOracle(OracleObservation),
     Apply(Command),
     EngineSnapshot,
     Book(AssetId),
@@ -40,6 +43,7 @@ pub enum RuntimeRequest {
 /// Typed responses corresponding to [`RuntimeRequest`] variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeReply {
+    OracleObserved(Result<(), ObservationReject>),
     Applied(ApplyResult),
     EngineSnapshot(EngineSnapshot),
     Book(BookSnapshot),
@@ -58,15 +62,18 @@ pub enum RuntimeError {
     ShuttingDown,
     /// The requester stopped waiting before the owner delivered its reply.
     ReplyDropped,
+    /// At least one placement asset has no current oracle observation.
+    OracleStale(AssetId),
 }
 
 impl fmt::Display for RuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Overloaded => "runtime request queue is full",
-            Self::ShuttingDown => "runtime is shutting down",
-            Self::ReplyDropped => "runtime reply receiver was dropped",
-        })
+        match self {
+            Self::Overloaded => formatter.write_str("runtime request queue is full"),
+            Self::ShuttingDown => formatter.write_str("runtime is shutting down"),
+            Self::ReplyDropped => formatter.write_str("runtime reply receiver was dropped"),
+            Self::OracleStale(asset) => write!(formatter, "oracle_stale for {}", asset.symbol()),
+        }
     }
 }
 
@@ -217,33 +224,43 @@ async fn run_owner(
     mut requests: mpsc::Receiver<RuntimeEnvelope>,
     publisher: RuntimeEventPublisher,
 ) {
+    let mut oracle = OracleState::default();
     let mut last_sequence = None;
     publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::Initializing));
 
     while let Some(envelope) = requests.recv().await {
         let shutdown = matches!(envelope.request, RuntimeRequest::Shutdown);
         let reply = match &envelope.request {
+            RuntimeRequest::ObserveOracle(observation) => {
+                Ok(RuntimeReply::OracleObserved(oracle.observe(*observation)))
+            }
             RuntimeRequest::Apply(command) => {
-                let result = engine.apply(command.clone());
-                for record in &result.events {
-                    last_sequence = Some(record.sequence);
-                    publisher.publish(RuntimeEvent::Event {
-                        record: record.clone(),
-                        freshness: RuntimeFreshness::Current { sequence: record.sequence },
-                    });
+                if let Some(asset) = stale_placement_asset(command, &oracle) {
+                    Err(RuntimeError::OracleStale(asset))
+                } else {
+                    let result = engine.apply(command.clone());
+                    for record in &result.events {
+                        last_sequence = Some(record.sequence);
+                        publisher.publish(RuntimeEvent::Event {
+                            record: record.clone(),
+                            freshness: RuntimeFreshness::Current { sequence: record.sequence },
+                        });
+                    }
+                    Ok(RuntimeReply::Applied(result))
                 }
-                RuntimeReply::Applied(result)
             }
-            RuntimeRequest::EngineSnapshot => RuntimeReply::EngineSnapshot(engine.snapshot()),
-            RuntimeRequest::Book(asset) => RuntimeReply::Book(engine.book_snapshot(*asset)),
-            RuntimeRequest::Account(user) => RuntimeReply::Account(engine.account_snapshot(user)),
-            RuntimeRequest::Order(order_id) => RuntimeReply::Order(engine.order(*order_id)),
+            RuntimeRequest::EngineSnapshot => Ok(RuntimeReply::EngineSnapshot(engine.snapshot())),
+            RuntimeRequest::Book(asset) => Ok(RuntimeReply::Book(engine.book_snapshot(*asset))),
+            RuntimeRequest::Account(user) => {
+                Ok(RuntimeReply::Account(engine.account_snapshot(user)))
+            }
+            RuntimeRequest::Order(order_id) => Ok(RuntimeReply::Order(engine.order(*order_id))),
             RuntimeRequest::EventsAfter(sequence) => {
-                RuntimeReply::Events(engine.events_after(*sequence))
+                Ok(RuntimeReply::Events(engine.events_after(*sequence)))
             }
-            RuntimeRequest::Shutdown => RuntimeReply::Shutdown,
+            RuntimeRequest::Shutdown => Ok(RuntimeReply::Shutdown),
         };
-        let _ = envelope.respond(Ok(reply));
+        let _ = envelope.respond(reply);
 
         if shutdown {
             requests.close();
@@ -257,6 +274,15 @@ async fn run_owner(
     }
 
     publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
+}
+
+fn stale_placement_asset(command: &Command, oracle: &OracleState) -> Option<AssetId> {
+    let Command::PlaceBatch { timestamp, orders, .. } = command else {
+        return None;
+    };
+    orders.iter().map(|order| order.asset).find(|asset| {
+        !matches!(oracle.freshness(*asset, *timestamp), OracleFreshness::Fresh { .. })
+    })
 }
 
 #[cfg(test)]
