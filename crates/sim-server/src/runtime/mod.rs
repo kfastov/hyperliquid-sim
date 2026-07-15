@@ -5,10 +5,10 @@
 
 use hl_wire::{AssetId, SimUserId};
 use sim_core::{
-    AccountSnapshot, ApplyResult, BookSnapshot, Command, EngineSnapshot, EventRecord,
+    AccountSnapshot, ApplyResult, BookSnapshot, Command, Engine, EngineSnapshot, EventRecord,
     EventSequence, OrderId, OrderSnapshot,
 };
-use std::{error::Error, fmt, num::NonZeroUsize};
+use std::{error::Error, fmt, num::NonZeroUsize, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Capacity limits for the runtime command queue and event fan-out.
@@ -164,6 +164,99 @@ pub fn bounded_runtime(
     let (requests, receiver) = mpsc::channel(limits.request_capacity.get());
     let (events, _) = broadcast::channel(limits.event_capacity.get());
     (RuntimeHandle { requests, events: events.clone() }, receiver, RuntimeEventPublisher { events })
+}
+
+/// Completion handle for the exclusively owned engine task.
+#[derive(Debug)]
+pub struct RuntimeTask {
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeTaskError {
+    TimedOut,
+    OwnerFailed,
+}
+
+impl fmt::Display for RuntimeTaskError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::TimedOut => "runtime did not stop within the graceful shutdown bound",
+            Self::OwnerFailed => "runtime owner task failed",
+        })
+    }
+}
+
+impl Error for RuntimeTaskError {}
+
+impl RuntimeTask {
+    /// Waits for graceful completion, aborting the owner if the bound expires.
+    pub async fn wait(mut self, bound: Duration) -> Result<(), RuntimeTaskError> {
+        match tokio::time::timeout(bound, &mut self.task).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(RuntimeTaskError::OwnerFailed),
+            Err(_) => {
+                self.task.abort();
+                let _ = self.task.await;
+                Err(RuntimeTaskError::TimedOut)
+            }
+        }
+    }
+}
+
+/// Starts the only task that owns and mutates the deterministic engine.
+#[must_use]
+pub fn start_runtime(seed: u64, limits: RuntimeLimits) -> (RuntimeHandle, RuntimeTask) {
+    let (handle, receiver, publisher) = bounded_runtime(limits);
+    let task = tokio::spawn(run_owner(Engine::new(seed), receiver, publisher));
+    (handle, RuntimeTask { task })
+}
+
+async fn run_owner(
+    mut engine: Engine,
+    mut requests: mpsc::Receiver<RuntimeEnvelope>,
+    publisher: RuntimeEventPublisher,
+) {
+    let mut last_sequence = None;
+    publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::Initializing));
+
+    while let Some(envelope) = requests.recv().await {
+        let shutdown = matches!(envelope.request, RuntimeRequest::Shutdown);
+        let reply = match &envelope.request {
+            RuntimeRequest::Apply(command) => {
+                let result = engine.apply(command.clone());
+                for record in &result.events {
+                    last_sequence = Some(record.sequence);
+                    publisher.publish(RuntimeEvent::Event {
+                        record: record.clone(),
+                        freshness: RuntimeFreshness::Current { sequence: record.sequence },
+                    });
+                }
+                RuntimeReply::Applied(result)
+            }
+            RuntimeRequest::EngineSnapshot => RuntimeReply::EngineSnapshot(engine.snapshot()),
+            RuntimeRequest::Book(asset) => RuntimeReply::Book(engine.book_snapshot(*asset)),
+            RuntimeRequest::Account(user) => RuntimeReply::Account(engine.account_snapshot(user)),
+            RuntimeRequest::Order(order_id) => RuntimeReply::Order(engine.order(*order_id)),
+            RuntimeRequest::EventsAfter(sequence) => {
+                RuntimeReply::Events(engine.events_after(*sequence))
+            }
+            RuntimeRequest::Shutdown => RuntimeReply::Shutdown,
+        };
+        let _ = envelope.respond(Ok(reply));
+
+        if shutdown {
+            requests.close();
+            publisher
+                .publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
+            while let Some(queued) = requests.recv().await {
+                let _ = queued.respond(Err(RuntimeError::ShuttingDown));
+            }
+            return;
+        }
+    }
+
+    publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
 }
 
 #[cfg(test)]
