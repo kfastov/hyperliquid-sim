@@ -18,13 +18,15 @@ use sim_core::{
     ApplyResult, CancelOrder, CancelStatus, Command, CommandResult, OrderSnapshot, OrderState,
     PlaceOrder, PlacementDisposition, PlacementStatus, Side, TimeInForce,
 };
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 /// Resource bounds enforced before requests reach the runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HttpConfig {
     pub max_batch: usize,
     pub max_body_bytes: usize,
+    pub max_observation_age_ms: u64,
+    pub runtime_reply_timeout: Duration,
 }
 
 /// One accepted read-only oracle observation.
@@ -39,6 +41,7 @@ pub struct MarketObservation {
 /// Atomic read-only market view used by a single HTTP request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketSnapshot {
+    pub captured_at: u64,
     pub observations: Vec<MarketObservation>,
 }
 
@@ -207,6 +210,13 @@ async fn exchange(
             "unsupported exchange action",
         );
     }
+    if value.as_object().is_some_and(|object| object.contains_key("expiresAfter")) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            ErrorCategory::Unsupported,
+            "expiresAfter is unsupported",
+        );
+    }
     let envelope: ExchangeEnvelope = match serde_json::from_value(value) {
         Ok(envelope) => envelope,
         Err(_) => return invalid("invalid exchange request"),
@@ -222,6 +232,9 @@ async fn exchange(
     let timestamp = envelope.nonce;
     let command = match envelope.action {
         ExchangeAction::Order { orders, .. } => {
+            if orders.is_empty() {
+                return invalid("order batch must not be empty");
+            }
             if orders.len() > state.config.max_batch {
                 return invalid("order batch exceeds configured limit");
             }
@@ -277,6 +290,9 @@ async fn exchange(
             Command::PlaceBatch { user, timestamp, orders: translated }
         }
         ExchangeAction::Cancel { cancels } => {
+            if cancels.is_empty() {
+                return invalid("cancel batch must not be empty");
+            }
             if cancels.len() > state.config.max_batch {
                 return invalid("cancel batch exceeds configured limit");
             }
@@ -443,12 +459,20 @@ fn observation(snapshot: &MarketSnapshot, asset: AssetId) -> Option<&MarketObser
 }
 
 fn market_snapshot(state: &AppState) -> Result<MarketSnapshot, ApiResponse> {
-    let snapshot = state.market.snapshot().map_err(|_| internal("market view is unavailable"))?;
+    let mut snapshot =
+        state.market.snapshot().map_err(|_| internal("market view is unavailable"))?;
     let complete_and_unique = AssetId::ALL.into_iter().all(|asset| {
         snapshot.observations.iter().filter(|entry| entry.asset == asset).count() == 1
     }) && snapshot.observations.len() == AssetId::ALL.len();
     if !complete_and_unique {
         return Err(internal("market snapshot is invalid"));
+    }
+    for observation in &mut snapshot.observations {
+        let stale_by_timestamp = match snapshot.captured_at.checked_sub(observation.observed_at) {
+            Some(age) => age > state.config.max_observation_age_ms,
+            None => true,
+        };
+        observation.is_stale |= stale_by_timestamp;
     }
     Ok(snapshot)
 }
@@ -458,7 +482,10 @@ async fn runtime_request(
     request: RuntimeRequest,
 ) -> Result<RuntimeReply, ApiResponse> {
     let pending = state.runtime.try_request(request).map_err(runtime_error)?;
-    pending.receive().await.map_err(runtime_error)
+    match tokio::time::timeout(state.config.runtime_reply_timeout, pending.receive()).await {
+        Ok(reply) => reply.map_err(runtime_error),
+        Err(_) => Err(unavailable("runtime is unavailable")),
+    }
 }
 
 fn runtime_error(error_value: RuntimeError) -> ApiResponse {
@@ -557,6 +584,10 @@ fn unauthorized() -> ApiResponse {
 
 fn internal(message: &'static str) -> ApiResponse {
     error(StatusCode::INTERNAL_SERVER_ERROR, ErrorCategory::Internal, message)
+}
+
+fn unavailable(message: &'static str) -> ApiResponse {
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCategory::Internal, message)
 }
 
 fn error(status: StatusCode, category: ErrorCategory, message: impl Into<String>) -> ApiResponse {

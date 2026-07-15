@@ -13,7 +13,14 @@ use sim_server::{
     RuntimeError, RuntimeEvent, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
     bounded_runtime,
 };
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
@@ -26,6 +33,19 @@ struct StaticMarket(MarketSnapshot);
 impl MarketView for StaticMarket {
     fn snapshot(&self) -> Result<MarketSnapshot, MarketViewError> {
         Ok(self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct CountingMarket {
+    calls: Arc<AtomicUsize>,
+    snapshot: MarketSnapshot,
+}
+
+impl MarketView for CountingMarket {
+    fn snapshot(&self) -> Result<MarketSnapshot, MarketViewError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.snapshot.clone())
     }
 }
 
@@ -46,23 +66,24 @@ impl RuntimePort for OverloadedPort {
 
 fn market(stale: Option<AssetId>) -> Arc<dyn MarketView> {
     Arc::new(StaticMarket(MarketSnapshot {
+        captured_at: 1_000,
         observations: vec![
             MarketObservation {
                 asset: AssetId::BTC,
                 oracle_price: PriceTicks::new(600_001).unwrap(),
-                observed_at: 100,
+                observed_at: 1_000,
                 is_stale: stale == Some(AssetId::BTC),
             },
             MarketObservation {
                 asset: AssetId::ETH,
                 oracle_price: PriceTicks::new(300_025).unwrap(),
-                observed_at: 101,
+                observed_at: 1_000,
                 is_stale: stale == Some(AssetId::ETH),
             },
             MarketObservation {
                 asset: AssetId::SOL,
                 oracle_price: PriceTicks::new(15_025).unwrap(),
-                observed_at: 102,
+                observed_at: 1_000,
                 is_stale: stale == Some(AssetId::SOL),
             },
         ],
@@ -101,7 +122,24 @@ fn app(
     market: Arc<dyn MarketView>,
     max_batch: usize,
 ) -> axum::Router {
-    router_with_config(runtime, market, HttpConfig { max_batch, max_body_bytes: 16 * 1024 })
+    app_with_config(
+        runtime,
+        market,
+        HttpConfig {
+            max_batch,
+            max_body_bytes: 16 * 1024,
+            max_observation_age_ms: 60_000,
+            runtime_reply_timeout: Duration::from_secs(1),
+        },
+    )
+}
+
+fn app_with_config(
+    runtime: Arc<dyn RuntimePort>,
+    market: Arc<dyn MarketView>,
+    config: HttpConfig,
+) -> axum::Router {
+    router_with_config(runtime, market, config)
 }
 
 async fn post(
@@ -144,7 +182,7 @@ async fn public_info_variants_are_fixed_order_and_canonical() {
     assert_eq!(contexts[0], meta);
     assert_eq!(
         contexts[1][0],
-        json!({"oraclePx":"60000.1","midPx":"60000.1","observedAt":100,"isStale":false})
+        json!({"oraclePx":"60000.1","midPx":"60000.1","observedAt":1000,"isStale":false})
     );
 
     let (_, book) = post(app, "/info", json!({"type":"l2Book","coin":"BTC"}), None).await;
@@ -277,4 +315,95 @@ async fn runtime_overload_has_stable_category() {
     let (status, body) = post(app, "/info", json!({"type":"l2Book","coin":"BTC"}), None).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"]["category"], "overloaded");
+}
+
+#[tokio::test]
+async fn explicit_expiry_and_empty_batches_fail_closed() {
+    let app = app(runtime(), market(None), 8);
+
+    for expiry in [json!(null), json!(1_234)] {
+        let mut request = exchange(json!({"type":"cancel","cancels":[{"a":0,"o":1}]}));
+        request["expiresAfter"] = expiry;
+        let (status, body) = post(app.clone(), "/exchange", request, Some(ALICE)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["category"], "unsupported");
+    }
+
+    for action in
+        [json!({"type":"order","orders":[],"grouping":"na"}), json!({"type":"cancel","cancels":[]})]
+    {
+        let (status, body) = post(app.clone(), "/exchange", exchange(action), Some(ALICE)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["category"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn placement_derives_freshness_from_snapshot_timestamps() {
+    for (observed_at, provider_stale, expected_status) in [
+        (40_000, false, StatusCode::OK),
+        (39_999, false, StatusCode::SERVICE_UNAVAILABLE),
+        (100_001, false, StatusCode::SERVICE_UNAVAILABLE),
+        (100_000, true, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let snapshot = MarketSnapshot {
+            captured_at: 100_000,
+            observations: AssetId::ALL
+                .into_iter()
+                .map(|asset| MarketObservation {
+                    asset,
+                    oracle_price: PriceTicks::new(1).unwrap(),
+                    observed_at: if asset == AssetId::BTC { observed_at } else { 100_000 },
+                    is_stale: asset == AssetId::BTC && provider_stale,
+                })
+                .collect(),
+        };
+        let app = app(runtime(), Arc::new(StaticMarket(snapshot)), 8);
+        let request = exchange(json!({
+            "type":"order",
+            "orders":[order(0,true,"1","0.00001","Gtc")],
+            "grouping":"na"
+        }));
+        let (status, body) = post(app, "/exchange", request, Some(ALICE)).await;
+        assert_eq!(status, expected_status, "observed_at={observed_at}, body={body}");
+        if expected_status == StatusCode::SERVICE_UNAVAILABLE {
+            assert_eq!(body["error"]["category"], "oracle_stale");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancel_does_not_read_market_snapshot() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting_market = CountingMarket {
+        calls: Arc::clone(&calls),
+        snapshot: MarketSnapshot { captured_at: 0, observations: Vec::new() },
+    };
+    let app = app(runtime(), Arc::new(counting_market), 8);
+    let cancel = exchange(json!({"type":"cancel","cancels":[{"a":0,"o":1}]}));
+    let (status, _) = post(app, "/exchange", cancel, Some(ALICE)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn accepted_runtime_request_without_reply_times_out_stably() {
+    let limits = RuntimeLimits::new(NonZeroUsize::MIN, NonZeroUsize::MIN);
+    let (port, mut owner, _) = bounded_runtime(limits);
+    tokio::spawn(async move {
+        let _envelope = owner.recv().await.expect("request was accepted");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let config = HttpConfig {
+        max_batch: 8,
+        max_body_bytes: 16 * 1024,
+        max_observation_age_ms: 60_000,
+        runtime_reply_timeout: Duration::from_millis(10),
+    };
+    let app = app_with_config(Arc::new(port), market(None), config);
+
+    let (status, body) = post(app, "/info", json!({"type":"l2Book","coin":"BTC"}), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["category"], "internal");
+    assert_eq!(body["error"]["message"], "runtime is unavailable");
 }
