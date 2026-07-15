@@ -148,6 +148,18 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(mock_gh_json.call_count, 2)
 
     @patch.object(gpp, "gh_json")
+    def test_closed_issue_with_only_open_pr_is_rejected(self, mock_gh_json):
+        mock_gh_json.side_effect = [
+            self.issue(),
+            {"mergeCommit": None, "mergedAt": None, "state": "OPEN"},
+        ]
+
+        with self.assertRaisesRegex(gpp.ProtocolError, "not accepted by merged PR"):
+            gpp.validate_dependencies(self.root, [1])
+
+        self.assertEqual(mock_gh_json.call_count, 2)
+
+    @patch.object(gpp, "gh_json")
     def test_open_issue_is_rejected_without_pr_lookup(self, mock_gh_json):
         mock_gh_json.return_value = self.issue(
             state="OPEN",
