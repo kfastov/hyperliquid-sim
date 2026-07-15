@@ -2,22 +2,26 @@ mod config;
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use config::{Config, OracleMode};
+use hl_wire::api::Subscription;
+use hl_wire::response::EventChannel;
 use hl_wire::{AssetId, DecimalScale, PriceTicks};
 use oracle_hyperliquid::{
     Clock, LiveConfig, NoJitter, ObservationSource, OracleIngestEvent, OracleObservation,
     OracleOrchestrator, PriceScales, ReconnectBackoff, SystemClock, TokioHyperliquidTransport,
     TokioSleeper, TransportFactory,
 };
+use sim_core::{BookSnapshot, EventRecord};
 use sim_server::http::{
     HttpConfig, MarketObservation, MarketSnapshot, MarketView, MarketViewError, router_with_config,
 };
 use sim_server::runtime::actors::SeededLocalActors;
 use sim_server::runtime::{OracleAssetHealth, RuntimeOracleHealth};
 use sim_server::runtime::{RuntimeTask, RuntimeTaskError, start_runtime};
+use sim_server::ws::{SnapshotView, ViewError, ViewMessage, WsLimits};
 use sim_server::{
     RuntimeError, RuntimeHandle, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
 };
-use std::{fmt, io, process::ExitCode, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, io, process::ExitCode, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
@@ -163,6 +167,148 @@ fn project_market_snapshot(
     Ok(MarketSnapshot { captured_at, observations })
 }
 
+/// Synchronous WS projections only read this immutable cache. It is populated
+/// through bounded async runtime requests before the listener starts, so the
+/// adapter's synchronous `SnapshotView` seam never blocks the runtime owner.
+#[derive(Debug)]
+struct LifecycleSnapshotView {
+    state: Arc<LifecycleState>,
+    sequence: u64,
+    books: BTreeMap<AssetId, BookSnapshot>,
+}
+
+impl LifecycleSnapshotView {
+    fn new(
+        state: Arc<LifecycleState>,
+        sequence: u64,
+        books: impl IntoIterator<Item = BookSnapshot>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            sequence,
+            books: books.into_iter().map(|book| (book.asset, book)).collect(),
+        })
+    }
+}
+
+impl SnapshotView for LifecycleSnapshotView {
+    fn initial(&self, subscription: &Subscription) -> Result<Option<ViewMessage>, ViewError> {
+        let message = match subscription {
+            Subscription::AllMids {} => Some(ViewMessage::new(
+                EventChannel::AllMids,
+                self.sequence,
+                fresh_all_mids(self.state.snapshot())?,
+            )),
+            Subscription::L2Book { coin } => Some(ViewMessage::new(
+                EventChannel::L2Book,
+                self.sequence,
+                project_l2_book(
+                    self.books.get(coin).ok_or_else(|| ViewError::new("book unavailable"))?,
+                ),
+            )),
+            Subscription::OrderUpdates { .. } => Some(ViewMessage::new(
+                EventChannel::OrderUpdates,
+                self.sequence,
+                serde_json::json!([]),
+            )),
+            Subscription::Trades { .. } => None,
+        };
+        Ok(message)
+    }
+
+    fn update(
+        &self,
+        _subscription: &Subscription,
+        _record: &EventRecord,
+    ) -> Result<Option<ViewMessage>, ViewError> {
+        // Live event projections are deliberately deferred to WS-B.
+        Ok(None)
+    }
+}
+
+async fn refresh_snapshot_view(
+    runtime: &dyn RuntimePort,
+    state: Arc<LifecycleState>,
+    bound: Duration,
+) -> Result<Arc<dyn SnapshotView>, LifecycleError> {
+    let sequence =
+        match request_with_timeout(runtime, RuntimeRequest::EngineSnapshot, bound).await? {
+            RuntimeReply::EngineSnapshot(snapshot) => snapshot.sequence,
+            _ => return Err(LifecycleError::UnexpectedRuntimeReply),
+        };
+    let mut books = Vec::with_capacity(AssetId::ALL.len());
+    for asset in AssetId::ALL {
+        match request_with_timeout(runtime, RuntimeRequest::Book(asset), bound).await? {
+            RuntimeReply::Book(book) if book.asset == asset => books.push(book),
+            _ => return Err(LifecycleError::UnexpectedRuntimeReply),
+        }
+    }
+    Ok(LifecycleSnapshotView::new(state, sequence, books))
+}
+
+fn fresh_all_mids(cache: OracleCacheSnapshot) -> Result<serde_json::Value, ViewError> {
+    let snapshot = project_market_snapshot(cache, SystemClock.now_ms())
+        .map_err(|_| ViewError::new("oracle snapshot unavailable"))?;
+    if snapshot.observations.iter().any(|observation| observation.is_stale) {
+        return Err(ViewError::new("oracle snapshot is stale"));
+    }
+    Ok(serde_json::Value::Object(
+        snapshot
+            .observations
+            .into_iter()
+            .map(|observation| {
+                (
+                    observation.asset.symbol().to_owned(),
+                    serde_json::json!(format_price(observation.asset, observation.oracle_price)),
+                )
+            })
+            .collect(),
+    ))
+}
+
+fn project_l2_book(book: &BookSnapshot) -> serde_json::Value {
+    let levels = [&book.bids, &book.asks].map(|side| {
+        side.iter()
+            .map(|level| {
+                serde_json::json!({
+                    "px": format_price(book.asset, level.price),
+                    "sz": format_size(book.asset, level.quantity_lots),
+                    "n": 1
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    serde_json::json!({"coin": book.asset, "time": 0, "levels": levels})
+}
+
+fn format_price(asset: AssetId, price: PriceTicks) -> String {
+    price.format(match asset {
+        AssetId::BTC => DecimalScale::new(1).expect("fixed BTC price scale"),
+        AssetId::ETH => DecimalScale::new(2).expect("fixed ETH price scale"),
+        AssetId::SOL => DecimalScale::new(3).expect("fixed SOL price scale"),
+    })
+}
+
+fn format_size(asset: AssetId, lots: u128) -> String {
+    let places = match asset {
+        AssetId::BTC => 5,
+        AssetId::ETH => 4,
+        AssetId::SOL => 2,
+    };
+    let digits = lots.to_string();
+    if digits.len() <= places {
+        return format!("0.{lots:0>places$}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned();
+    }
+    let split = digits.len() - places;
+    format!("{}.{}", &digits[..split], &digits[split..])
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
 async fn healthz() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
 }
@@ -226,10 +372,15 @@ fn http_config(config: &Config) -> HttpConfig {
     }
 }
 
+fn ws_limits(config: &Config) -> WsLimits {
+    WsLimits::new(config.max_ws_subscriptions.get(), config.ws_outbound_capacity.get())
+}
+
 fn service_router(
     config: &Config,
     runtime: Arc<dyn RuntimePort>,
     market: Arc<dyn MarketView>,
+    snapshots: Arc<dyn SnapshotView>,
 ) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -239,7 +390,8 @@ fn service_router(
             market: Arc::clone(&market),
             reply_timeout: (config.reply_timeout / 2).max(Duration::from_millis(1)),
         })
-        .merge(router_with_config(runtime, market, http_config(config)))
+        .merge(router_with_config(Arc::clone(&runtime), market, http_config(config)))
+        .merge(sim_server::ws::router(runtime, snapshots, ws_limits(config)))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, config.reply_timeout))
         .layer(ConcurrencyLimitLayer::new(config.max_concurrent_requests.get()))
 }
@@ -339,8 +491,30 @@ impl ServiceLifecycle {
         } = self;
 
         let _ = cancel.send(true);
-        // Release the listening socket before beginning the bounded shutdown of
-        // ingestion and the single runtime owner.
+        let ingestion_result =
+            match tokio::time::timeout(shutdown_timeout, &mut ingestion_task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(LifecycleError::IngestionTaskFailed),
+                Err(_) => {
+                    ingestion_task.abort();
+                    let _ = ingestion_task.await;
+                    Err(LifecycleError::IngestionTaskTimedOut)
+                }
+            };
+
+        // Publish the runtime's explicit shutting-down freshness before waiting
+        // for Axum. Active WebSockets then close themselves, allowing graceful
+        // listener release instead of forcing the listener task deadline.
+        let shutdown_result =
+            request_with_timeout(&runtime, RuntimeRequest::Shutdown, reply_timeout).await.and_then(
+                |reply| {
+                    if reply == RuntimeReply::Shutdown {
+                        Ok(())
+                    } else {
+                        Err(LifecycleError::UnexpectedRuntimeReply)
+                    }
+                },
+            );
         let listener_result = if let Some(mut listener_task) = listener_task {
             match tokio::time::timeout(shutdown_timeout, &mut listener_task).await {
                 Ok(Ok(result)) => result.map_err(LifecycleError::Listener),
@@ -354,34 +528,13 @@ impl ServiceLifecycle {
         } else {
             Ok(())
         };
-        let ingestion_result =
-            match tokio::time::timeout(shutdown_timeout, &mut ingestion_task).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(LifecycleError::IngestionTaskFailed),
-                Err(_) => {
-                    ingestion_task.abort();
-                    let _ = ingestion_task.await;
-                    Err(LifecycleError::IngestionTaskTimedOut)
-                }
-            };
-
-        let shutdown_result =
-            request_with_timeout(&runtime, RuntimeRequest::Shutdown, reply_timeout).await.and_then(
-                |reply| {
-                    if reply == RuntimeReply::Shutdown {
-                        Ok(())
-                    } else {
-                        Err(LifecycleError::UnexpectedRuntimeReply)
-                    }
-                },
-            );
         drop(runtime);
         let owner_result =
             runtime_task.wait(shutdown_timeout).await.map_err(LifecycleError::RuntimeTask);
 
-        listener_result?;
         ingestion_result?;
         shutdown_result?;
+        listener_result?;
         owner_result
     }
 }
@@ -693,24 +846,41 @@ async fn main() -> ExitCode {
     };
 
     let mut lifecycle = start_lifecycle(&config);
+    let router_runtime: Arc<dyn RuntimePort> = Arc::new(lifecycle.runtime.clone());
+    let router_snapshots = match refresh_snapshot_view(
+        &*router_runtime,
+        lifecycle.state.clone(),
+        config.reply_timeout,
+    )
+    .await
+    {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            eprintln!("sim-server WebSocket snapshot startup failed: {error}");
+            let _ = lifecycle.shutdown().await;
+            return ExitCode::FAILURE;
+        }
+    };
     let mut listener_cancel = lifecycle.cancel.subscribe();
     let (listener_done, listener_stopped) = oneshot::channel();
-    let router_runtime: Arc<dyn RuntimePort> = Arc::new(lifecycle.runtime.clone());
     let router_market: Arc<dyn MarketView> =
         Arc::new(LifecycleMarketView::new(lifecycle.state.clone()));
     let listener_task = tokio::spawn(async move {
-        let result = axum::serve(listener, service_router(&config, router_runtime, router_market))
-            .with_graceful_shutdown(async move {
+        let result = axum::serve(
+            listener,
+            service_router(&config, router_runtime, router_market, router_snapshots),
+        )
+        .with_graceful_shutdown(async move {
+            if *listener_cancel.borrow() {
+                return;
+            }
+            while listener_cancel.changed().await.is_ok() {
                 if *listener_cancel.borrow() {
                     return;
                 }
-                while listener_cancel.changed().await.is_ok() {
-                    if *listener_cancel.borrow() {
-                        return;
-                    }
-                }
-            })
-            .await;
+            }
+        })
+        .await;
         let _ = listener_done.send(());
         result
     });
@@ -761,6 +931,11 @@ mod tests {
             ("SIM_SHUTDOWN_TIMEOUT_MS", "500"),
         ])
         .expect("test lifecycle config")
+    }
+
+    fn test_snapshot_view(state: Arc<LifecycleState>) -> Arc<dyn SnapshotView> {
+        let snapshot = Engine::new(7).snapshot();
+        LifecycleSnapshotView::new(state, snapshot.sequence, snapshot.books)
     }
 
     async fn runtime_request(runtime: &dyn RuntimePort, request: RuntimeRequest) -> RuntimeReply {
@@ -984,6 +1159,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validated_ws_bounds_map_without_reinterpretation() {
+        let config = Config::from_pairs(&[
+            ("SIM_MAX_WS_SUBSCRIPTIONS", "7"),
+            ("SIM_WS_OUTBOUND_CAPACITY", "19"),
+        ])
+        .expect("validated WebSocket config");
+        assert_eq!(ws_limits(&config), WsLimits::new(7, 19));
+    }
+
     #[tokio::test]
     async fn readiness_transitions_from_503_to_200_when_local_cache_completes() {
         let limits = RuntimeLimits::new(NonZeroUsize::new(8).unwrap(), NonZeroUsize::MIN);
@@ -1000,6 +1185,7 @@ mod tests {
             &config,
             Arc::new(runtime.clone()),
             Arc::new(LifecycleMarketView::new(state.clone())),
+            test_snapshot_view(state.clone()),
         );
 
         assert_eq!(
@@ -1031,7 +1217,8 @@ mod tests {
         let response = readiness_response(service_router(
             &test_config(false),
             Arc::new(runtime),
-            Arc::new(LifecycleMarketView::new(state)),
+            Arc::new(LifecycleMarketView::new(state.clone())),
+            test_snapshot_view(state),
         ))
         .await;
         assert_eq!(
@@ -1058,7 +1245,8 @@ mod tests {
             readiness_response(service_router(
                 &config,
                 Arc::new(overloaded_runtime),
-                Arc::new(LifecycleMarketView::new(overloaded_state)),
+                Arc::new(LifecycleMarketView::new(overloaded_state.clone())),
+                test_snapshot_view(overloaded_state),
             ))
             .await,
             (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())
@@ -1074,7 +1262,8 @@ mod tests {
             readiness_response(service_router(
                 &config,
                 Arc::new(timed_out_runtime),
-                Arc::new(LifecycleMarketView::new(timed_out_state)),
+                Arc::new(LifecycleMarketView::new(timed_out_state.clone())),
+                test_snapshot_view(timed_out_state),
             ))
             .await,
             (StatusCode::SERVICE_UNAVAILABLE, "{\"status\":\"not_ready\"}".to_owned())

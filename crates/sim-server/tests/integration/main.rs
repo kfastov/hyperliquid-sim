@@ -8,7 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{ClientRequestBuilder, Message},
+};
 
 const PROCESS_BOUND: Duration = Duration::from_secs(5);
 const ALICE: &str = "0x1111111111111111111111111111111111111111";
@@ -125,6 +130,49 @@ fn run_bind_failure(address: SocketAddr) -> Output {
     server_command(address).output().expect("run bind-failure process")
 }
 
+async fn receive_ws_json<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let message = tokio::time::timeout(PROCESS_BOUND, socket.next())
+            .await
+            .expect("WebSocket response exceeded process bound")
+            .expect("WebSocket closed before response")
+            .expect("valid WebSocket frame");
+        if message.is_text() {
+            return serde_json::from_str(message.to_text().expect("WebSocket text frame"))
+                .expect("WebSocket JSON response");
+        }
+    }
+}
+
+async fn subscribe_and_snapshot<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    subscription: Value,
+    channel: &str,
+) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::text(
+            json!({"method":"subscribe","subscription":subscription.clone()}).to_string(),
+        ))
+        .await
+        .expect("send subscription");
+    assert_eq!(
+        receive_ws_json(socket).await,
+        json!({
+            "channel":"subscriptionResponse",
+            "data":{"method":"subscribe","subscription":subscription}
+        })
+    );
+    let snapshot = receive_ws_json(socket).await;
+    assert_eq!(snapshot["channel"], channel);
+    snapshot
+}
+
 #[test]
 fn health_sigterm_zero_exit_and_port_reuse() {
     let address = unused_loopback_addr();
@@ -163,6 +211,102 @@ fn occupied_bind_fails_without_starting_a_service() {
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(stderr.contains("sim-server listener bind failed:"), "{stderr}");
     assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_websocket_process_exposes_truthful_initial_profile_and_bounded_shutdown() {
+    let address = unused_loopback_addr();
+    let child = server_command(address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut child = ChildGuard(child);
+    wait_for_response(address, "/readyz", "HTTP/1.1 200 OK\r\n");
+    let url = format!("ws://{address}/ws");
+
+    let (mut public, upgrade) = connect_async(&url).await.expect("public WebSocket upgrade");
+    assert_eq!(upgrade.status(), 101);
+    let mids = subscribe_and_snapshot(&mut public, json!({"type":"allMids"}), "allMids").await;
+    assert_eq!(mids["data"], json!({"BTC":"100000","ETH":"3000","SOL":"150"}));
+    assert!(mids["sequence"].as_u64().is_some());
+
+    let book =
+        subscribe_and_snapshot(&mut public, json!({"type":"l2Book","coin":"BTC"}), "l2Book").await;
+    assert_eq!(book["data"], json!({"coin":"BTC","time":0,"levels":[[],[]]}));
+
+    public.send(Message::text(r#"{"method":"ping"}"#)).await.expect("send JSON ping");
+    assert_eq!(receive_ws_json(&mut public).await, json!({"channel":"pong"}));
+    public.send(Message::Ping(vec![1, 2, 3].into())).await.expect("send frame ping");
+    let pong = tokio::time::timeout(PROCESS_BOUND, public.next())
+        .await
+        .expect("frame pong bound")
+        .expect("socket remains open")
+        .expect("valid pong");
+    assert_eq!(pong, Message::Pong(vec![1, 2, 3].into()));
+
+    public
+        .send(Message::text(
+            r#"{"method":"subscribe","subscription":{"type":"candles","coin":"BTC"}}"#,
+        ))
+        .await
+        .expect("send unsupported subscription");
+    assert_eq!(receive_ws_json(&mut public).await["data"]["category"], "unsupported");
+    public
+        .send(Message::text(format!(
+            r#"{{"method":"subscribe","subscription":{{"type":"orderUpdates","user":"{ALICE}"}}}}"#
+        )))
+        .await
+        .expect("send unauthenticated private subscription");
+    assert_eq!(receive_ws_json(&mut public).await["data"]["category"], "unauthorized_sim_user");
+
+    let non_normalized = ClientRequestBuilder::new(url.parse().expect("WebSocket URI"))
+        .with_header("X-Sim-User", ALICE.to_ascii_uppercase());
+    let (mut malformed_identity, _) =
+        connect_async(non_normalized).await.expect("upgrade with untrusted header");
+    malformed_identity
+        .send(Message::text(format!(
+            r#"{{"method":"subscribe","subscription":{{"type":"orderUpdates","user":"{ALICE}"}}}}"#
+        )))
+        .await
+        .expect("send private subscription");
+    assert_eq!(
+        receive_ws_json(&mut malformed_identity).await["data"]["category"],
+        "unauthorized_sim_user"
+    );
+    malformed_identity.close(None).await.expect("close malformed identity socket");
+
+    let authenticated = ClientRequestBuilder::new(url.parse().expect("WebSocket URI"))
+        .with_header("X-Sim-User", ALICE);
+    let (mut private, _) = connect_async(authenticated).await.expect("authenticated upgrade");
+    let updates = subscribe_and_snapshot(
+        &mut private,
+        json!({"type":"orderUpdates","user":ALICE}),
+        "orderUpdates",
+    )
+    .await;
+    assert_eq!(updates["data"], json!([]));
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(signal.success());
+    let closed = tokio::time::timeout(PROCESS_BOUND, async {
+        loop {
+            match private.next().await {
+                Some(Ok(message)) if message.is_close() => return true,
+                None | Some(Err(_)) => return true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("WebSocket closes within shutdown bound");
+    assert!(closed);
+    assert_eq!(wait_for_exit(&mut child.0).code(), Some(0));
+    let rebound = TcpListener::bind(address).expect("listener released after WebSocket shutdown");
+    drop(rebound);
 }
 
 #[test]
