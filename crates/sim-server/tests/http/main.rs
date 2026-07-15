@@ -2,10 +2,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use hl_wire::{AssetId, PriceTicks, SimUserId};
+use hl_wire::{AssetId, PriceTicks};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use sim_core::{Command, Engine};
+use sim_core::Engine;
 use sim_server::http::{
     HttpConfig, MarketObservation, MarketSnapshot, MarketView, MarketViewError, router_with_config,
 };
@@ -75,16 +75,18 @@ fn runtime() -> Arc<dyn RuntimePort> {
     tokio::spawn(async move {
         let mut engine = Engine::new(7);
         while let Some(envelope) = owner.recv().await {
-            let reply = match envelope.request {
-                RuntimeRequest::Apply(command) => RuntimeReply::Applied(engine.apply(command)),
-                RuntimeRequest::EngineSnapshot => RuntimeReply::EngineSnapshot(engine.snapshot()),
-                RuntimeRequest::Book(asset) => RuntimeReply::Book(engine.book_snapshot(asset)),
-                RuntimeRequest::Account(user) => {
-                    RuntimeReply::Account(engine.account_snapshot(&user))
+            let reply = match &envelope.request {
+                RuntimeRequest::Apply(command) => {
+                    RuntimeReply::Applied(engine.apply(command.clone()))
                 }
-                RuntimeRequest::Order(id) => RuntimeReply::Order(engine.order(id)),
+                RuntimeRequest::EngineSnapshot => RuntimeReply::EngineSnapshot(engine.snapshot()),
+                RuntimeRequest::Book(asset) => RuntimeReply::Book(engine.book_snapshot(*asset)),
+                RuntimeRequest::Account(user) => {
+                    RuntimeReply::Account(engine.account_snapshot(user))
+                }
+                RuntimeRequest::Order(id) => RuntimeReply::Order(engine.order(*id)),
                 RuntimeRequest::EventsAfter(sequence) => {
-                    RuntimeReply::Events(engine.events_after(sequence))
+                    RuntimeReply::Events(engine.events_after(*sequence))
                 }
                 RuntimeRequest::Shutdown => RuntimeReply::Shutdown,
             };
