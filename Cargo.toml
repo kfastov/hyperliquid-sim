@@ -24,6 +24,6 @@ sim-core = { path = "crates/sim-core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util", "limit", "buffer"] }
 tower-http = { version = "0.6", features = ["limit", "trace", "cors", "timeout"] }

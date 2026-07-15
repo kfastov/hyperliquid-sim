@@ -472,17 +472,22 @@ impl<C: Clock> OracleTransport for TokioHyperliquidTransport<C> {
                             continue;
                         };
                         match parse_ws_inbound(&payload) {
-                            Ok(WsInbound::ActiveAssetCtx { .. }) => {
-                                // The payload has arrived and passed strict channel/asset parsing
-                                // before the injected receive clock is sampled.
+                            Ok(WsInbound::ActiveAssetCtx { asset, oracle_px }) => {
+                                let Ok(price) =
+                                    PriceTicks::parse(&oracle_px, scales.for_asset(asset))
+                                else {
+                                    continue;
+                                };
+                                // Sample the injected receive clock only after the supported asset
+                                // and its positive, exactly-scaled oracle price are fully validated.
                                 let observed_at_ms = self.clock.now_ms();
-                                return parse_active_asset_ctx(
-                                    &payload,
+                                return Ok(OracleObservation {
+                                    asset,
+                                    price,
                                     observed_at_ms,
                                     upstream_sequence,
-                                    scales,
-                                )
-                                .map_err(LiveTransportError::Parse);
+                                    source: ObservationSource::ActiveAssetCtx,
+                                });
                             }
                             Ok(WsInbound::SubscriptionAcknowledged(_) | WsInbound::Pong)
                             | Err(_) => continue,
