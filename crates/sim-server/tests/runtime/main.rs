@@ -211,6 +211,15 @@ async fn runtime_clock_owns_freshness_boundaries_and_command_time_cannot_bypass_
         request(&port, RuntimeRequest::Apply(stale)).await,
         Err(RuntimeError::OracleStale(AssetId::BTC))
     );
+    let RuntimeReply::OracleHealth(health) =
+        request(&port, RuntimeRequest::OracleHealth).await.expect("health reply")
+    else {
+        panic!("health received wrong reply variant")
+    };
+    assert!(matches!(
+        health.assets[0],
+        OracleAssetHealth::Observed { freshness: OracleFreshness::Stale { age_ms: 60_001 }, .. }
+    ));
     assert!(matches!(
         request(&port, RuntimeRequest::Book(AssetId::BTC)).await,
         Ok(RuntimeReply::Book(_))
