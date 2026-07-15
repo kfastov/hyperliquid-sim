@@ -3,6 +3,8 @@
 //! Decimal strings are converted exactly to integer ticks/lots. This crate has
 //! no exchange state and performs no identity inference or network activity.
 
+pub mod api;
+
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
