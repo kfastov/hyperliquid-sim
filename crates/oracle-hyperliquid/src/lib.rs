@@ -5,7 +5,7 @@
 //! capability.
 
 use hl_wire::{AssetId, DecimalScale, PriceTicks, WireValueError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -127,10 +127,95 @@ pub enum OracleParseError {
     InvalidPrice(WireValueError),
 }
 
+/// Fixed public subscriptions used by the live oracle. The DTO is deliberately
+/// not a generic request: callers cannot express any other upstream method.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ActiveAssetCtxSubscription {
+    method: &'static str,
+    subscription: ActiveAssetCtxSubscriptionData,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ActiveAssetCtxSubscriptionData {
+    #[serde(rename = "type")]
+    channel_type: &'static str,
+    coin: &'static str,
+}
+
+impl ActiveAssetCtxSubscription {
+    #[must_use]
+    pub const fn for_asset(asset: AssetId) -> Self {
+        let coin = match asset {
+            AssetId::BTC => "BTC",
+            AssetId::ETH => "ETH",
+            AssetId::SOL => "SOL",
+        };
+        Self {
+            method: "subscribe",
+            subscription: ActiveAssetCtxSubscriptionData { channel_type: "activeAssetCtx", coin },
+        }
+    }
+}
+
+/// Valid control/data messages accepted from the public WebSocket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WsInbound {
+    SubscriptionAcknowledged(AssetId),
+    ActiveAssetCtx { asset: AssetId, oracle_px: String },
+    Pong,
+}
+
 #[derive(Deserialize)]
-struct ActiveAssetCtxMessage {
+#[serde(deny_unknown_fields)]
+struct ChannelEnvelope {
     channel: String,
-    data: ActiveAssetCtxData,
+    #[serde(default)]
+    data: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscriptionResponseData {
+    method: String,
+    subscription: SubscriptionResponseSubscription,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscriptionResponseSubscription {
+    #[serde(rename = "type")]
+    channel_type: String,
+    coin: String,
+}
+
+/// Strictly classifies the only inbound messages needed by the oracle.
+pub fn parse_ws_inbound(value: &Value) -> Result<WsInbound, OracleParseError> {
+    let envelope: ChannelEnvelope =
+        serde_json::from_value(value.clone()).map_err(|_| OracleParseError::Malformed)?;
+    match envelope.channel.as_str() {
+        "pong" if envelope.data.is_none() => Ok(WsInbound::Pong),
+        "subscriptionResponse" => {
+            let data: SubscriptionResponseData =
+                serde_json::from_value(envelope.data.ok_or(OracleParseError::Malformed)?)
+                    .map_err(|_| OracleParseError::Malformed)?;
+            if data.method != "subscribe" || data.subscription.channel_type != "activeAssetCtx" {
+                return Err(OracleParseError::UnexpectedChannel);
+            }
+            let asset = AssetId::from_symbol(&data.subscription.coin)
+                .map_err(|_| OracleParseError::UnsupportedAsset)?;
+            Ok(WsInbound::SubscriptionAcknowledged(asset))
+        }
+        "activeAssetCtx" => {
+            let message: ActiveAssetCtxData =
+                serde_json::from_value(envelope.data.ok_or(OracleParseError::Malformed)?)
+                    .map_err(|_| OracleParseError::Malformed)?;
+            let asset = AssetId::from_symbol(&message.coin)
+                .map_err(|_| OracleParseError::UnsupportedAsset)?;
+            Ok(WsInbound::ActiveAssetCtx { asset, oracle_px: message.ctx.oracle_px })
+        }
+        "pong" => Err(OracleParseError::Malformed),
+        _ => Err(OracleParseError::UnexpectedChannel),
+    }
 }
 
 #[derive(Deserialize)]
@@ -152,14 +237,10 @@ pub fn parse_active_asset_ctx(
     upstream_sequence: u64,
     scales: PriceScales,
 ) -> Result<OracleObservation, OracleParseError> {
-    let message: ActiveAssetCtxMessage =
-        serde_json::from_value(value.clone()).map_err(|_| OracleParseError::Malformed)?;
-    if message.channel != "activeAssetCtx" {
+    let WsInbound::ActiveAssetCtx { asset, oracle_px } = parse_ws_inbound(value)? else {
         return Err(OracleParseError::UnexpectedChannel);
-    }
-    let asset =
-        AssetId::from_symbol(&message.data.coin).map_err(|_| OracleParseError::UnsupportedAsset)?;
-    let price = PriceTicks::parse(&message.data.ctx.oracle_px, scales.for_asset(asset))
+    };
+    let price = PriceTicks::parse(&oracle_px, scales.for_asset(asset))
         .map_err(OracleParseError::InvalidPrice)?;
     Ok(OracleObservation {
         asset,
@@ -365,6 +446,74 @@ mod tests {
             scales(),
         )
         .expect("valid active context")
+    }
+
+    #[test]
+    fn subscription_dtos_are_fixed_to_the_three_public_active_asset_channels() {
+        let requests = AssetId::ALL.map(|asset| {
+            serde_json::to_value(ActiveAssetCtxSubscription::for_asset(asset))
+                .expect("serialize subscription")
+        });
+        assert_eq!(
+            requests,
+            [
+                json!({"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"BTC"}}),
+                json!({"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"ETH"}}),
+                json!({"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":"SOL"}}),
+            ]
+        );
+    }
+
+    #[test]
+    fn classifies_ack_updates_and_pong_fixtures() {
+        for (symbol, asset, price) in [
+            ("BTC", AssetId::BTC, "60123.45"),
+            ("ETH", AssetId::ETH, "3123.40"),
+            ("SOL", AssetId::SOL, "142.01"),
+        ] {
+            assert_eq!(
+                parse_ws_inbound(&json!({
+                    "channel":"subscriptionResponse",
+                    "data":{"method":"subscribe","subscription":{"type":"activeAssetCtx","coin":symbol}}
+                })),
+                Ok(WsInbound::SubscriptionAcknowledged(asset))
+            );
+            assert_eq!(
+                parse_ws_inbound(&json!({
+                    "channel":"activeAssetCtx",
+                    "data":{"coin":symbol,"ctx":{"oraclePx":price,"markPx":"ignored"}}
+                })),
+                Ok(WsInbound::ActiveAssetCtx { asset, oracle_px: price.to_owned() })
+            );
+        }
+        assert_eq!(parse_ws_inbound(&json!({"channel":"pong"})), Ok(WsInbound::Pong));
+    }
+
+    #[test]
+    fn malformed_spot_and_unrequested_channels_are_rejected() {
+        assert_eq!(
+            parse_ws_inbound(&json!({"channel":"activeAssetCtx","data":{"coin":"BTC","ctx":{}}})),
+            Err(OracleParseError::Malformed)
+        );
+        assert_eq!(
+            parse_ws_inbound(&json!({
+                "channel":"activeAssetCtx",
+                "data":{"coin":"@107","ctx":{"oraclePx":"1.0"}}
+            })),
+            Err(OracleParseError::UnsupportedAsset)
+        );
+        assert_eq!(
+            parse_ws_inbound(&json!({"channel":"allMids","data":{"mids":{}}})),
+            Err(OracleParseError::UnexpectedChannel)
+        );
+        assert_eq!(
+            parse_ws_inbound(&json!({"channel":"pong","data":{}})),
+            Err(OracleParseError::Malformed)
+        );
+        assert_eq!(
+            parse_ws_inbound(&json!({"channel":"pong","extra":true})),
+            Err(OracleParseError::Malformed)
+        );
     }
 
     #[test]
