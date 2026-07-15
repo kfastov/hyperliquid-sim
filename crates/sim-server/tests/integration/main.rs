@@ -18,6 +18,7 @@ use tokio_tungstenite::{
 const PROCESS_BOUND: Duration = Duration::from_secs(5);
 const ALICE: &str = "0x1111111111111111111111111111111111111111";
 const BOB: &str = "0x2222222222222222222222222222222222222222";
+const CHARLIE: &str = "0x3333333333333333333333333333333333333333";
 const SIG: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct ChildGuard(Child);
@@ -173,6 +174,37 @@ where
     snapshot
 }
 
+async fn subscribe_without_snapshot<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    subscription: Value,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::text(
+            json!({"method":"subscribe","subscription":subscription.clone()}).to_string(),
+        ))
+        .await
+        .expect("send subscription");
+    assert_eq!(
+        receive_ws_json(socket).await,
+        json!({
+            "channel":"subscriptionResponse",
+            "data":{"method":"subscribe","subscription":subscription}
+        })
+    );
+}
+
+async fn assert_no_ws_message<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next()).await.is_err(),
+        "unrelated subscriber received a leaked event"
+    );
+}
+
 #[test]
 fn health_sigterm_zero_exit_and_port_reuse() {
     let address = unused_loopback_addr();
@@ -307,6 +339,130 @@ async fn offline_websocket_process_exposes_truthful_initial_profile_and_bounded_
     assert_eq!(wait_for_exit(&mut child.0).code(), Some(0));
     let rebound = TcpListener::bind(address).expect("listener released after WebSocket shutdown");
     drop(rebound);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_process_projects_private_fills_trades_and_sequenced_books_without_leaks() {
+    let address = unused_loopback_addr();
+    let child = server_command(address)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut child = ChildGuard(child);
+    wait_for_response(address, "/readyz", "HTTP/1.1 200 OK\r\n");
+    let url = format!("ws://{address}/ws");
+
+    async fn private_socket(
+        url: &str,
+        user: &'static str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let request = ClientRequestBuilder::new(url.parse().expect("WebSocket URI"))
+            .with_header("X-Sim-User", user);
+        let (mut socket, _) = connect_async(request).await.expect("authenticated upgrade");
+        let snapshot = subscribe_and_snapshot(
+            &mut socket,
+            json!({"type":"orderUpdates","user":user}),
+            "orderUpdates",
+        )
+        .await;
+        assert_eq!(snapshot["data"], json!([]));
+        socket
+    }
+
+    let mut alice = private_socket(&url, ALICE).await;
+    let mut bob = private_socket(&url, BOB).await;
+    let mut unrelated = private_socket(&url, CHARLIE).await;
+    let (mut public, _) = connect_async(&url).await.expect("public upgrade");
+    let initial_book =
+        subscribe_and_snapshot(&mut public, json!({"type":"l2Book","coin":"BTC"}), "l2Book").await;
+    subscribe_without_snapshot(&mut public, json!({"type":"trades","coin":"BTC"})).await;
+    let initial_sequence = initial_book["sequence"].as_u64().expect("book sequence");
+
+    let maker_order = format!(
+        r#"{{"action":{{"type":"order","orders":[{{"a":0,"b":false,"p":"100000","s":"0.00002","r":false,"t":{{"limit":{{"tif":"Gtc"}}}}}}],"grouping":"na"}},"nonce":1000,"signature":{{"r":"{SIG}","s":"{SIG}","v":27}},"vaultAddress":null}}"#
+    );
+    let (status, maker_reply) = post_json(address, "/exchange", Some(ALICE), &maker_order);
+    assert_eq!(status, 200);
+    let maker_id = maker_reply["response"]["data"]["statuses"][0]["resting"]["oid"]
+        .as_u64()
+        .expect("maker rests");
+    let accepted = receive_ws_json(&mut alice).await;
+    let rested = receive_ws_json(&mut alice).await;
+    assert_eq!(accepted["data"][0]["status"], "open");
+    assert_eq!(accepted["data"][0]["order"]["oid"], maker_id);
+    assert_eq!(rested["data"][0]["status"], "open");
+    assert!(accepted["sequence"].as_u64().unwrap() > initial_sequence);
+    let rested_book = receive_ws_json(&mut public).await;
+    assert_eq!(rested_book["channel"], "l2Book");
+    assert_eq!(rested_book["data"]["levels"][1][0]["sz"], "0.00002");
+    assert_no_ws_message(&mut bob).await;
+    assert_no_ws_message(&mut unrelated).await;
+
+    let taker_order = format!(
+        r#"{{"action":{{"type":"order","orders":[{{"a":0,"b":true,"p":"100001","s":"0.00001","r":false,"t":{{"limit":{{"tif":"Gtc"}}}}}}],"grouping":"na"}},"nonce":1001,"signature":{{"r":"{SIG}","s":"{SIG}","v":27}},"vaultAddress":null}}"#
+    );
+    let (status, taker_reply) = post_json(address, "/exchange", Some(BOB), &taker_order);
+    assert_eq!(status, 200);
+    assert!(taker_reply["response"]["data"]["statuses"][0]["filled"].is_object());
+
+    let alice_fill = receive_ws_json(&mut alice).await;
+    let alice_final = receive_ws_json(&mut alice).await;
+    assert_eq!(alice_fill["data"][0]["status"], "fill");
+    assert_eq!(alice_fill["data"][0]["order"]["oid"], maker_id);
+    assert_eq!(alice_fill["data"][0]["fill"]["px"], "100000");
+    assert_eq!(alice_fill["data"][0]["fill"]["sz"], "0.00001");
+    assert_eq!(alice_final["data"][0]["status"], "open");
+
+    let bob_accepted = receive_ws_json(&mut bob).await;
+    let bob_fill = receive_ws_json(&mut bob).await;
+    let bob_final = receive_ws_json(&mut bob).await;
+    assert_eq!(bob_accepted["data"][0]["status"], "open");
+    assert_eq!(bob_fill["data"][0]["status"], "fill");
+    assert_eq!(bob_fill["data"][0]["fill"]["px"], "100000");
+    assert_eq!(bob_final["data"][0]["status"], "filled");
+    assert_eq!(alice_fill["sequence"], bob_fill["sequence"]);
+
+    let fill_sequence = alice_fill["sequence"].as_u64().expect("fill sequence");
+    let mut saw_trade = false;
+    let mut saw_fill_book = false;
+    for _ in 0..4 {
+        let message = receive_ws_json(&mut public).await;
+        if message["channel"] == "trades" {
+            assert_eq!(message["sequence"], fill_sequence);
+            assert_eq!(message["data"][0]["px"], "100000");
+            assert_eq!(message["data"][0]["sz"], "0.00001");
+            assert_eq!(message["data"][0]["side"], "B");
+            saw_trade = true;
+        }
+        if message["channel"] == "l2Book" && message["sequence"] == fill_sequence {
+            assert_eq!(message["data"]["levels"][1][0]["sz"], "0.00001");
+            saw_fill_book = true;
+        }
+    }
+    assert!(saw_trade, "fill must reach trades subscriber");
+    assert!(saw_fill_book, "fill sequence must reach l2 subscriber");
+    assert_no_ws_message(&mut unrelated).await;
+
+    let cancel = format!(
+        r#"{{"action":{{"type":"cancel","cancels":[{{"a":0,"o":{maker_id}}}]}},"nonce":1002,"signature":{{"r":"{SIG}","s":"{SIG}","v":27}},"vaultAddress":null}}"#
+    );
+    let (status, cancelled) = post_json(address, "/exchange", Some(ALICE), &cancel);
+    assert_eq!(status, 200);
+    assert_eq!(cancelled["response"]["data"]["statuses"], json!(["success"]));
+    let alice_cancel = receive_ws_json(&mut alice).await;
+    assert_eq!(alice_cancel["data"][0]["status"], "canceled");
+    assert_eq!(alice_cancel["data"][0]["order"]["oid"], maker_id);
+    assert_no_ws_message(&mut bob).await;
+    assert_no_ws_message(&mut unrelated).await;
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(signal.success());
+    assert_eq!(wait_for_exit(&mut child.0).code(), Some(0));
 }
 
 #[test]

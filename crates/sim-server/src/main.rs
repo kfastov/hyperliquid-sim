@@ -10,7 +10,10 @@ use oracle_hyperliquid::{
     OracleOrchestrator, PriceScales, ReconnectBackoff, SystemClock, TokioHyperliquidTransport,
     TokioSleeper, TransportFactory,
 };
-use sim_core::{BookSnapshot, EventRecord};
+use sim_core::{
+    BookLevel, BookSnapshot, EngineSnapshot, Event, EventRecord, Fill, OrderSnapshot, OrderState,
+    Side,
+};
 use sim_server::http::{
     HttpConfig, MarketObservation, MarketSnapshot, MarketView, MarketViewError, router_with_config,
 };
@@ -21,7 +24,13 @@ use sim_server::ws::{SnapshotView, ViewError, ViewMessage, WsLimits};
 use sim_server::{
     RuntimeError, RuntimeHandle, RuntimeLimits, RuntimePort, RuntimeReply, RuntimeRequest,
 };
-use std::{collections::BTreeMap, fmt, io, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt, io,
+    process::ExitCode,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot, watch},
@@ -173,42 +182,218 @@ fn project_market_snapshot(
 #[derive(Debug)]
 struct LifecycleSnapshotView {
     state: Arc<LifecycleState>,
-    sequence: u64,
-    books: BTreeMap<AssetId, BookSnapshot>,
+    projection: Mutex<ProjectionCache>,
 }
 
 impl LifecycleSnapshotView {
-    fn new(
-        state: Arc<LifecycleState>,
-        sequence: u64,
-        books: impl IntoIterator<Item = BookSnapshot>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            state,
-            sequence,
-            books: books.into_iter().map(|book| (book.asset, book)).collect(),
-        })
+    fn new(state: Arc<LifecycleState>, snapshot: EngineSnapshot, capacity: usize) -> Arc<Self> {
+        Arc::new(Self { state, projection: Mutex::new(ProjectionCache::new(snapshot, capacity)) })
+    }
+
+    fn project(&self, record: &EventRecord) -> Result<ProjectedEvent, ViewError> {
+        self.projection
+            .lock()
+            .map_err(|_| ViewError::new("projection cache unavailable"))?
+            .project(record)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProjectedEvent {
+    l2_book: Option<(AssetId, serde_json::Value)>,
+    trade: Option<(AssetId, serde_json::Value)>,
+    order_updates: HashMap<hl_wire::SimUserId, serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct ProjectionCache {
+    sequence: u64,
+    capacity: usize,
+    books: BTreeMap<AssetId, BookSnapshot>,
+    orders: BTreeMap<u64, OrderSnapshot>,
+    recent: VecDeque<(u64, ProjectedEvent)>,
+}
+
+impl ProjectionCache {
+    fn new(snapshot: EngineSnapshot, capacity: usize) -> Self {
+        Self {
+            sequence: snapshot.sequence,
+            capacity: capacity.max(1),
+            books: snapshot.books.into_iter().map(|book| (book.asset, book)).collect(),
+            orders: snapshot.orders.into_iter().map(|order| (order.id, order)).collect(),
+            recent: VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn project(&mut self, record: &EventRecord) -> Result<ProjectedEvent, ViewError> {
+        if record.sequence <= self.sequence {
+            return self
+                .recent
+                .iter()
+                .find_map(|(sequence, projected)| {
+                    (*sequence == record.sequence).then(|| projected.clone())
+                })
+                .ok_or_else(|| ViewError::new("event projection expired"));
+        }
+        if record.sequence != self.sequence.saturating_add(1) {
+            return Err(ViewError::new("event projection sequence gap"));
+        }
+
+        let projected = self.apply(record)?;
+        self.sequence = record.sequence;
+        self.recent.push_back((record.sequence, projected.clone()));
+        while self.recent.len() > self.capacity {
+            self.recent.pop_front();
+        }
+        Ok(projected)
+    }
+
+    fn apply(&mut self, record: &EventRecord) -> Result<ProjectedEvent, ViewError> {
+        let mut projected = ProjectedEvent::default();
+        match &record.event {
+            Event::OrderAccepted { order } => {
+                self.orders.insert(order.id, order.clone());
+                projected.order_updates.insert(
+                    order.user.clone(),
+                    project_order_update(order, "open", record.timestamp, None),
+                );
+            }
+            Event::Fill { fill } => {
+                let maker = {
+                    let maker = self
+                        .orders
+                        .get_mut(&fill.maker_order_id)
+                        .ok_or_else(|| ViewError::new("maker order unavailable"))?;
+                    maker.remaining_lots = maker
+                        .remaining_lots
+                        .checked_sub(fill.quantity_lots)
+                        .ok_or_else(|| ViewError::new("maker fill exceeds remaining size"))?;
+                    maker.state = if maker.remaining_lots == 0 {
+                        OrderState::Filled
+                    } else {
+                        OrderState::Open
+                    };
+                    maker.clone()
+                };
+                rebuild_book(&mut self.books, &self.orders, fill.asset, record.sequence)?;
+                projected.l2_book = Some((
+                    fill.asset,
+                    project_l2_book(
+                        self.books
+                            .get(&fill.asset)
+                            .ok_or_else(|| ViewError::new("book unavailable"))?,
+                        record.timestamp,
+                    ),
+                ));
+                projected.order_updates.insert(
+                    fill.maker.clone(),
+                    project_order_update(
+                        &maker,
+                        "fill",
+                        record.timestamp,
+                        Some(project_fill(fill, maker.side)),
+                    ),
+                );
+
+                let taker = {
+                    let taker = self
+                        .orders
+                        .get_mut(&fill.taker_order_id)
+                        .ok_or_else(|| ViewError::new("taker order unavailable"))?;
+                    taker.remaining_lots = taker
+                        .remaining_lots
+                        .checked_sub(fill.quantity_lots)
+                        .ok_or_else(|| ViewError::new("taker fill exceeds remaining size"))?;
+                    taker.clone()
+                };
+                projected.order_updates.insert(
+                    fill.taker.clone(),
+                    project_order_update(
+                        &taker,
+                        "fill",
+                        record.timestamp,
+                        Some(project_fill(fill, taker.side)),
+                    ),
+                );
+                projected.trade = Some((fill.asset, project_trade(fill, record.timestamp)));
+            }
+            Event::OrderUpdated { order_id, user, asset, remaining_lots, state } => {
+                let order = {
+                    let order = self
+                        .orders
+                        .get_mut(order_id)
+                        .ok_or_else(|| ViewError::new("updated order unavailable"))?;
+                    if order.user != *user || order.asset != *asset {
+                        return Err(ViewError::new("updated order identity mismatch"));
+                    }
+                    order.remaining_lots = *remaining_lots;
+                    order.state = *state;
+                    order.clone()
+                };
+                rebuild_book(&mut self.books, &self.orders, *asset, record.sequence)?;
+                projected.l2_book = Some((
+                    *asset,
+                    project_l2_book(
+                        self.books.get(asset).ok_or_else(|| ViewError::new("book unavailable"))?,
+                        record.timestamp,
+                    ),
+                ));
+                projected.order_updates.insert(
+                    user.clone(),
+                    project_order_update(&order, order_state_name(*state), record.timestamp, None),
+                );
+            }
+            Event::OrderCancelled { order_id, user, asset, .. } => {
+                let order = {
+                    let order = self
+                        .orders
+                        .get_mut(order_id)
+                        .ok_or_else(|| ViewError::new("cancelled order unavailable"))?;
+                    if order.user != *user || order.asset != *asset {
+                        return Err(ViewError::new("cancelled order identity mismatch"));
+                    }
+                    order.state = OrderState::Cancelled;
+                    order.clone()
+                };
+                rebuild_book(&mut self.books, &self.orders, *asset, record.sequence)?;
+                projected.l2_book = Some((
+                    *asset,
+                    project_l2_book(
+                        self.books.get(asset).ok_or_else(|| ViewError::new("book unavailable"))?,
+                        record.timestamp,
+                    ),
+                ));
+                projected.order_updates.insert(
+                    user.clone(),
+                    project_order_update(&order, "canceled", record.timestamp, None),
+                );
+            }
+        }
+        Ok(projected)
     }
 }
 
 impl SnapshotView for LifecycleSnapshotView {
     fn initial(&self, subscription: &Subscription) -> Result<Option<ViewMessage>, ViewError> {
+        let projection =
+            self.projection.lock().map_err(|_| ViewError::new("projection cache unavailable"))?;
         let message = match subscription {
             Subscription::AllMids {} => Some(ViewMessage::new(
                 EventChannel::AllMids,
-                self.sequence,
+                projection.sequence,
                 fresh_all_mids(self.state.snapshot())?,
             )),
             Subscription::L2Book { coin } => Some(ViewMessage::new(
                 EventChannel::L2Book,
-                self.sequence,
+                projection.sequence,
                 project_l2_book(
-                    self.books.get(coin).ok_or_else(|| ViewError::new("book unavailable"))?,
+                    projection.books.get(coin).ok_or_else(|| ViewError::new("book unavailable"))?,
+                    0,
                 ),
             )),
             Subscription::OrderUpdates { .. } => Some(ViewMessage::new(
                 EventChannel::OrderUpdates,
-                self.sequence,
+                projection.sequence,
                 serde_json::json!([]),
             )),
             Subscription::Trades { .. } => None,
@@ -218,11 +403,30 @@ impl SnapshotView for LifecycleSnapshotView {
 
     fn update(
         &self,
-        _subscription: &Subscription,
-        _record: &EventRecord,
+        subscription: &Subscription,
+        record: &EventRecord,
     ) -> Result<Option<ViewMessage>, ViewError> {
-        // Live event projections are deliberately deferred to WS-B.
-        Ok(None)
+        let projected = self.project(record)?;
+        let message = match subscription {
+            // Runtime EventRecord currently represents engine transitions only;
+            // oracle observations have no compatible sequenced runtime event.
+            // allMids is therefore intentionally initial-only.
+            Subscription::AllMids {} => None,
+            Subscription::L2Book { coin } => projected
+                .l2_book
+                .filter(|(asset, _)| asset == coin)
+                .map(|(_, data)| ViewMessage::new(EventChannel::L2Book, record.sequence, data)),
+            Subscription::Trades { coin } => projected
+                .trade
+                .filter(|(asset, _)| asset == coin)
+                .map(|(_, data)| ViewMessage::new(EventChannel::Trades, record.sequence, data)),
+            Subscription::OrderUpdates { user } => projected
+                .order_updates
+                .get(user)
+                .cloned()
+                .map(|data| ViewMessage::new(EventChannel::OrderUpdates, record.sequence, data)),
+        };
+        Ok(message)
     }
 }
 
@@ -230,20 +434,26 @@ async fn refresh_snapshot_view(
     runtime: &dyn RuntimePort,
     state: Arc<LifecycleState>,
     bound: Duration,
+    capacity: usize,
 ) -> Result<Arc<dyn SnapshotView>, LifecycleError> {
-    let sequence =
+    // Subscribe before taking the snapshot. Records at/below its sequence are
+    // ignored and every later record is folded into the bounded cache.
+    let mut events = runtime.subscribe_events();
+    let snapshot =
         match request_with_timeout(runtime, RuntimeRequest::EngineSnapshot, bound).await? {
-            RuntimeReply::EngineSnapshot(snapshot) => snapshot.sequence,
+            RuntimeReply::EngineSnapshot(snapshot) => snapshot,
             _ => return Err(LifecycleError::UnexpectedRuntimeReply),
         };
-    let mut books = Vec::with_capacity(AssetId::ALL.len());
-    for asset in AssetId::ALL {
-        match request_with_timeout(runtime, RuntimeRequest::Book(asset), bound).await? {
-            RuntimeReply::Book(book) if book.asset == asset => books.push(book),
-            _ => return Err(LifecycleError::UnexpectedRuntimeReply),
+    let view = LifecycleSnapshotView::new(state, snapshot, capacity);
+    let projector = Arc::clone(&view);
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if let sim_server::RuntimeEvent::Event { record, freshness: _ } = event {
+                let _ = projector.project(&record);
+            }
         }
-    }
-    Ok(LifecycleSnapshotView::new(state, sequence, books))
+    });
+    Ok(view)
 }
 
 fn fresh_all_mids(cache: OracleCacheSnapshot) -> Result<serde_json::Value, ViewError> {
@@ -266,7 +476,97 @@ fn fresh_all_mids(cache: OracleCacheSnapshot) -> Result<serde_json::Value, ViewE
     ))
 }
 
-fn project_l2_book(book: &BookSnapshot) -> serde_json::Value {
+fn rebuild_book(
+    books: &mut BTreeMap<AssetId, BookSnapshot>,
+    orders: &BTreeMap<u64, OrderSnapshot>,
+    asset: AssetId,
+    sequence: u64,
+) -> Result<(), ViewError> {
+    let mut bids = BTreeMap::<PriceTicks, u128>::new();
+    let mut asks = BTreeMap::<PriceTicks, u128>::new();
+    for order in
+        orders.values().filter(|order| order.asset == asset && order.state == OrderState::Open)
+    {
+        let side = if order.side == Side::Bid { &mut bids } else { &mut asks };
+        let total = side.entry(order.price).or_default();
+        *total = total
+            .checked_add(u128::from(order.remaining_lots))
+            .ok_or_else(|| ViewError::new("book quantity overflow"))?;
+    }
+    let mut bids = bids
+        .into_iter()
+        .rev()
+        .map(|(price, quantity_lots)| BookLevel { price, quantity_lots })
+        .collect();
+    let asks =
+        asks.into_iter().map(|(price, quantity_lots)| BookLevel { price, quantity_lots }).collect();
+    books.insert(asset, BookSnapshot { asset, bids: std::mem::take(&mut bids), asks, sequence });
+    Ok(())
+}
+
+fn project_trade(fill: &Fill, timestamp: u64) -> serde_json::Value {
+    serde_json::json!([{
+        "coin": fill.asset,
+        "side": side_name(fill.taker_side),
+        // The engine executes at the resting maker order's exact integer price.
+        "px": format_price(fill.asset, fill.price),
+        "sz": format_size(fill.asset, u128::from(fill.quantity_lots)),
+        "time": timestamp,
+        "tid": fill.trade_id
+    }])
+}
+
+fn project_fill(fill: &Fill, owner_side: Side) -> serde_json::Value {
+    serde_json::json!({
+        "tid": fill.trade_id,
+        "side": side_name(owner_side),
+        "px": format_price(fill.asset, fill.price),
+        "sz": format_size(fill.asset, u128::from(fill.quantity_lots))
+    })
+}
+
+fn project_order_update(
+    order: &OrderSnapshot,
+    status: &str,
+    timestamp: u64,
+    fill: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut update = serde_json::json!({
+        "order": {
+            "coin": order.asset,
+            "side": side_name(order.side),
+            "limitPx": format_price(order.asset, order.price),
+            "sz": format_size(order.asset, u128::from(order.remaining_lots)),
+            "oid": order.id,
+            "timestamp": timestamp,
+            "origSz": format_size(order.asset, u128::from(order.quantity.value())),
+            "cloid": order.client_order_id
+        },
+        "status": status,
+        "statusTimestamp": timestamp
+    });
+    if let Some(fill) = fill {
+        update.as_object_mut().expect("fixed update object").insert("fill".to_owned(), fill);
+    }
+    serde_json::json!([update])
+}
+
+const fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "B",
+        Side::Ask => "A",
+    }
+}
+
+const fn order_state_name(state: OrderState) -> &'static str {
+    match state {
+        OrderState::Open => "open",
+        OrderState::Filled => "filled",
+        OrderState::Cancelled => "canceled",
+    }
+}
+
+fn project_l2_book(book: &BookSnapshot, timestamp: u64) -> serde_json::Value {
     let levels = [&book.bids, &book.asks].map(|side| {
         side.iter()
             .map(|level| {
@@ -278,7 +578,7 @@ fn project_l2_book(book: &BookSnapshot) -> serde_json::Value {
             })
             .collect::<Vec<_>>()
     });
-    serde_json::json!({"coin": book.asset, "time": 0, "levels": levels})
+    serde_json::json!({"coin": book.asset, "time": timestamp, "levels": levels})
 }
 
 fn format_price(asset: AssetId, price: PriceTicks) -> String {
@@ -851,6 +1151,7 @@ async fn main() -> ExitCode {
         &*router_runtime,
         lifecycle.state.clone(),
         config.reply_timeout,
+        config.event_capacity.get(),
     )
     .await
     {
@@ -935,7 +1236,7 @@ mod tests {
 
     fn test_snapshot_view(state: Arc<LifecycleState>) -> Arc<dyn SnapshotView> {
         let snapshot = Engine::new(7).snapshot();
-        LifecycleSnapshotView::new(state, snapshot.sequence, snapshot.books)
+        LifecycleSnapshotView::new(state, snapshot, 16)
     }
 
     async fn runtime_request(runtime: &dyn RuntimePort, request: RuntimeRequest) -> RuntimeReply {
