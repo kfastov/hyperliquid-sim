@@ -12,7 +12,15 @@ rust-version = "1.96"
 license = "MIT"
 
 [workspace.dependencies]
+axum = { version = "0.8", features = ["json", "ws"] }
+futures-util = "0.3"
 hl-wire = { path = "crates/hl-wire" }
+http-body-util = "0.1"
+serde_json = "1"
 sim-core = { path = "crates/sim-core" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util", "limit", "buffer"] }
+tower-http = { version = "0.6", features = ["limit", "trace", "cors", "timeout"] }
