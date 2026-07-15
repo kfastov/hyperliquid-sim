@@ -37,6 +37,7 @@ impl Clock for FakeClock {
 struct TransportScript {
     connect: Result<(), FakeError>,
     ws_delay: Duration,
+    ws_delays: VecDeque<Duration>,
     ws: VecDeque<Result<OracleObservation, FakeError>>,
     fallback: Result<Vec<OracleObservation>, FakeError>,
 }
@@ -68,7 +69,7 @@ impl OracleTransport for FakeTransport {
     ) -> UpstreamFuture<'_, OracleObservation, Self::Error> {
         self.log.lock().expect("log lock").push(format!("ws:{}:{upstream_sequence}", self.id));
         let result = self.script.ws.pop_front().expect("scripted WS result");
-        let delay = self.script.ws_delay;
+        let delay = self.script.ws_delays.pop_front().unwrap_or(self.script.ws_delay);
         Box::pin(async move {
             tokio::time::sleep(delay).await;
             result
@@ -178,6 +179,7 @@ async fn exact_ws_fallback_backoff_reconnect_recovery_and_shutdown_transcript() 
             TransportScript {
                 connect: Ok(()),
                 ws_delay: Duration::ZERO,
+                ws_delays: VecDeque::new(),
                 ws: VecDeque::from([
                     Ok(observation(
                         AssetId::BTC,
@@ -229,6 +231,7 @@ async fn exact_ws_fallback_backoff_reconnect_recovery_and_shutdown_transcript() 
             TransportScript {
                 connect: Ok(()),
                 ws_delay: Duration::ZERO,
+                ws_delays: VecDeque::new(),
                 ws: VecDeque::from([
                     Ok(observation(
                         AssetId::BTC,
@@ -409,12 +412,14 @@ async fn absolute_completeness_deadline_reconnects_and_resets_only_after_all_ass
             TransportScript {
                 connect: Err(FakeError::Disconnected),
                 ws_delay: Duration::ZERO,
+                ws_delays: VecDeque::new(),
                 ws: VecDeque::new(),
                 fallback: Err(FakeError::Disconnected),
             },
             TransportScript {
                 connect: Ok(()),
                 ws_delay: Duration::from_millis(3),
+                ws_delays: VecDeque::new(),
                 ws: VecDeque::from([
                     Ok(observation(AssetId::BTC, 60_000, 11, 1, ObservationSource::ActiveAssetCtx)),
                     Ok(observation(AssetId::BTC, 60_001, 12, 2, ObservationSource::ActiveAssetCtx)),
@@ -426,6 +431,7 @@ async fn absolute_completeness_deadline_reconnects_and_resets_only_after_all_ass
             TransportScript {
                 connect: Ok(()),
                 ws_delay: Duration::from_millis(1),
+                ws_delays: VecDeque::new(),
                 ws: VecDeque::from([
                     Ok(observation(AssetId::BTC, 60_100, 31, 5, ObservationSource::ActiveAssetCtx)),
                     Ok(observation(AssetId::ETH, 3_100, 32, 6, ObservationSource::ActiveAssetCtx)),
@@ -486,6 +492,109 @@ async fn absolute_completeness_deadline_reconnects_and_resets_only_after_all_ass
     assert!(transcript.windows(2).any(|pair| pair == ["fallback:3:8", "jitter:100->125"]));
 }
 
+#[tokio::test(start_paused = true)]
+async fn recovered_primary_still_falls_back_when_only_btc_keeps_progressing() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let fallback = |sequence, time| {
+        Ok(AssetId::ALL
+            .into_iter()
+            .map(|asset| {
+                observation(
+                    asset,
+                    20_000 + i64::from(asset.value()),
+                    time,
+                    sequence,
+                    ObservationSource::MetaAndAssetCtxs,
+                )
+            })
+            .collect())
+    };
+    let factory = FakeFactory {
+        scripts: VecDeque::from([
+            TransportScript {
+                connect: Ok(()),
+                ws_delay: Duration::ZERO,
+                ws_delays: VecDeque::from([
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::from_millis(3),
+                    Duration::from_millis(3),
+                    Duration::from_millis(3),
+                    Duration::from_millis(3),
+                ]),
+                ws: VecDeque::from([
+                    Ok(observation(AssetId::BTC, 60_000, 1, 1, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::ETH, 3_000, 2, 2, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::SOL, 140, 3, 3, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::BTC, 60_001, 4, 4, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::BTC, 60_002, 5, 5, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::BTC, 60_003, 6, 6, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::BTC, 60_004, 7, 7, ObservationSource::ActiveAssetCtx)),
+                ]),
+                fallback: fallback(7, 10),
+            },
+            TransportScript {
+                connect: Ok(()),
+                ws_delay: Duration::ZERO,
+                ws_delays: VecDeque::new(),
+                ws: VecDeque::from([
+                    Ok(observation(AssetId::BTC, 61_000, 20, 8, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::ETH, 3_100, 21, 9, ObservationSource::ActiveAssetCtx)),
+                    Ok(observation(AssetId::SOL, 150, 22, 10, ObservationSource::ActiveAssetCtx)),
+                    Err(FakeError::Disconnected),
+                ]),
+                fallback: fallback(11, 30),
+            },
+        ]),
+        log: Arc::clone(&log),
+        next_id: 0,
+    };
+    let sleeper =
+        FakeSleeper { log: Arc::clone(&log), calls: 0, stop_after: 2, shutdown: shutdown_tx };
+    let orchestrator = OracleOrchestrator::new(
+        factory,
+        sleeper,
+        FixedJitter { log: Arc::clone(&log) },
+        FakeClock(Arc::new(Mutex::new(VecDeque::from([1_000, 2_000])))),
+        ReconnectBackoff::new(Duration::from_millis(100), Duration::from_millis(400)),
+        scales(),
+    )
+    .with_primary_completeness_timeout(Duration::from_millis(10));
+    let (output_tx, mut output_rx) = mpsc::channel(64);
+
+    assert_eq!(orchestrator.run(output_tx, shutdown_rx).await, OrchestratorExit::Shutdown);
+
+    let mut events = Vec::new();
+    while let Some(event) = output_rx.recv().await {
+        events.push(event);
+    }
+    let stalled: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            OracleIngestEvent::Unavailable { asset, at_ms: 1_000 } => Some(*asset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stalled, vec![AssetId::ETH, AssetId::SOL]);
+    assert!(events.contains(&OracleIngestEvent::Observation(observation(
+        AssetId::BTC,
+        60_003,
+        6,
+        6,
+        ObservationSource::ActiveAssetCtx,
+    ))));
+    assert!(
+        !events.contains(&OracleIngestEvent::Unavailable { asset: AssetId::BTC, at_ms: 1_000 })
+    );
+
+    let transcript = log.lock().expect("log lock");
+    assert!(transcript.windows(2).any(|pair| pair == ["fallback:1:7", "jitter:100->125"]));
+    assert!(transcript.windows(2).any(|pair| pair == ["sleep:125", "factory:2"]));
+    assert!(transcript.windows(2).any(|pair| pair == ["fallback:2:11", "jitter:100->125"]));
+}
+
 #[derive(Clone, Copy)]
 struct ZeroJitter;
 
@@ -503,6 +612,7 @@ async fn zero_jitter_is_clamped_to_a_nonzero_retry_delay() {
         scripts: VecDeque::from([TransportScript {
             connect: Err(FakeError::Disconnected),
             ws_delay: Duration::ZERO,
+            ws_delays: VecDeque::new(),
             ws: VecDeque::new(),
             fallback: Err(FakeError::Disconnected),
         }]),

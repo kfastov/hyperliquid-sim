@@ -862,8 +862,9 @@ where
         }
     }
 
-    /// Overrides the absolute window in which a fresh primary connection must
-    /// produce at least one valid observation for every fixed asset.
+    /// Overrides the independent liveness window for every fixed primary asset.
+    /// A fresh connection must initially cover each asset within this window;
+    /// afterward, only a valid receipt for an asset advances that asset's deadline.
     #[must_use]
     pub fn with_primary_completeness_timeout(mut self, timeout: Duration) -> Self {
         self.primary_completeness_timeout = timeout.max(Duration::from_millis(1));
@@ -872,9 +873,9 @@ where
 
     /// Runs until cancellation or until the bounded observation consumer closes.
     /// Every failed connect/read marks all assets unavailable. A primary that is
-    /// still incomplete at its absolute deadline marks only its missing assets
-    /// unavailable. Both transitions immediately try the fixed HTTP fallback,
-    /// sleep once, and then create a fresh transport.
+    /// incomplete or has a stalled asset at an independent absolute deadline marks
+    /// only those assets unavailable. Both transitions immediately try the fixed
+    /// HTTP fallback, sleep once, and then create a fresh transport.
     pub async fn run(
         mut self,
         output: tokio::sync::mpsc::Sender<OracleIngestEvent>,
@@ -893,34 +894,40 @@ where
             if connected {
                 let mut coverage = [false; 3];
                 let mut primary_recovered = false;
-                let completeness_deadline =
-                    tokio::time::Instant::now() + self.primary_completeness_timeout;
+                let connected_at = tokio::time::Instant::now();
+                let initial_deadline =
+                    liveness_deadline(connected_at, self.primary_completeness_timeout);
+                let mut liveness_deadlines = [initial_deadline; 3];
                 loop {
                     let candidate = sequence.saturating_add(1);
-                    let read = if coverage.into_iter().all(|covered| covered) {
-                        until_shutdown(
-                            &mut shutdown,
-                            transport.next_active_asset_ctx(candidate, self.scales),
-                        )
-                        .await
-                        .map(DeadlineResult::Completed)
-                    } else {
-                        until_shutdown_or_deadline(
-                            &mut shutdown,
-                            completeness_deadline,
-                            transport.next_active_asset_ctx(candidate, self.scales),
-                        )
-                        .await
-                    };
+                    let next_deadline = *liveness_deadlines
+                        .iter()
+                        .min()
+                        .expect("fixed assets have liveness deadlines");
+                    let read = until_shutdown_or_deadline(
+                        &mut shutdown,
+                        next_deadline,
+                        transport.next_active_asset_ctx(candidate, self.scales),
+                    )
+                    .await;
                     match read {
                         None => return OrchestratorExit::Shutdown,
                         Some(DeadlineResult::Deadline) => {
-                            unavailable = coverage.map(|covered| !covered);
+                            let now = tokio::time::Instant::now();
+                            unavailable = liveness_deadlines.map(|deadline| deadline <= now);
                             break;
                         }
                         Some(DeadlineResult::Completed(Ok(observation))) => {
                             sequence = candidate;
-                            coverage[usize::from(observation.asset.value())] = true;
+                            let asset_index = usize::from(observation.asset.value());
+                            coverage[asset_index] = true;
+                            // Receipt time is authoritative for stream liveness. An
+                            // observation timestamp that is future or regressed cannot
+                            // extend this or any other asset's monotonic deadline.
+                            liveness_deadlines[asset_index] = liveness_deadline(
+                                tokio::time::Instant::now(),
+                                self.primary_completeness_timeout,
+                            );
                             if send_event(
                                 &output,
                                 &mut shutdown,
@@ -996,6 +1003,12 @@ where
             }
         }
     }
+}
+
+fn liveness_deadline(now: tokio::time::Instant, timeout: Duration) -> tokio::time::Instant {
+    // An unrepresentable future deadline fails closed immediately. The bounded,
+    // nonzero reconnect backoff below prevents this from becoming a tight loop.
+    now.checked_add(timeout).unwrap_or(now)
 }
 
 fn exit_for(shutdown: &tokio::sync::watch::Receiver<bool>) -> OrchestratorExit {
