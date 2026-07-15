@@ -4,6 +4,7 @@
 //! no exchange state and performs no identity inference or network activity.
 
 pub mod api;
+pub mod response;
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::{fmt, str::FromStr};
