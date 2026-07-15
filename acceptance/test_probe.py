@@ -189,9 +189,10 @@ def order_update(sequence, oid, status, price="99999.9", size="0.00001"):
 
 
 class ScriptedWebSocket:
-    def __init__(self, setup, events):
+    def __init__(self, setup, events, polled=None):
         self.setup = list(setup)
         self.events = list(events)
+        self.polled = list(polled or [])
         self.sent = []
         self.closed = False
 
@@ -200,6 +201,9 @@ class ScriptedWebSocket:
 
     def receive_json(self):
         return self.setup.pop(0) if self.setup else self.events.pop(0)
+
+    def poll_json(self, _timeout):
+        return self.polled.pop(0) if self.polled else None
 
     def close_cleanly(self):
         self.closed = True
@@ -282,8 +286,77 @@ class StateFlowTests(unittest.TestCase):
             )
 
 
+def trade_event(sequence=4, price="100000", size="0.00001", tid=9):
+    return {
+        "channel": "trades",
+        "sequence": sequence,
+        "data": [{
+            "coin": "BTC", "side": "B", "px": price, "sz": size,
+            "time": 2001, "tid": tid,
+        }],
+    }
+
+
+class TradeFlowTests(unittest.TestCase):
+    def dependencies(self, polled=None):
+        subscription = {"type": "trades", "coin": "BTC"}
+        ws = ScriptedWebSocket(
+            [subscription_ack(subscription)],
+            [
+                {"channel": "allMids", "sequence": 2, "data": {"BTC": "100000"}},
+                trade_event(),
+            ],
+            polled,
+        )
+        http = ScriptedHttp([
+            exchange_response("order", {"resting": {"oid": 7}}),
+            exchange_response("order", {"filled": {"totalSz": "0.00001", "avgPx": "100000", "oid": 8}}),
+            [],
+        ])
+        return http, ws
+
+    def run_flow(self, http, ws):
+        return probe.run_trade_flow(
+            http, "ws://mock/ws", 0.1, probe.DEFAULT_USER, probe.DEFAULT_TAKER,
+            lambda _url, _timeout, user: ws if user is None else self.fail("trade socket must be public"),
+        )
+
+    def test_scripted_trade_flow_uses_one_ack_only_subscription_and_exact_trade(self):
+        http, ws = self.dependencies()
+        result = self.run_flow(http, ws)
+        self.assertEqual(result, {"trades": 1, "maker_price": True})
+        self.assertTrue(ws.closed)
+        self.assertEqual(ws.sent, [{"method": "subscribe", "subscription": {"type": "trades", "coin": "BTC"}}])
+        self.assertEqual([call[0] for call in http.calls], ["/exchange", "/exchange", "/info"])
+        self.assertEqual(http.calls[0][2], probe.DEFAULT_USER)
+        self.assertEqual(http.calls[1][2], probe.DEFAULT_TAKER)
+        self.assertEqual(http.calls[2][1], {"type": "openOrders", "user": probe.DEFAULT_USER})
+
+    def test_scripted_trade_flow_rejects_status_cardinality(self):
+        http, ws = self.dependencies()
+        http.bodies[0]["response"]["data"]["statuses"].append({"resting": {"oid": 8}})
+        with self.assertRaisesRegex(probe.ProbeFailure, "exactly one ordered status"):
+            self.run_flow(http, ws)
+
+    def test_scripted_trade_flow_rejects_wrong_price_duplicate_and_unconsumed_maker(self):
+        cases = (
+            ("wrong_price", "maker price"),
+            ("duplicate", "duplicate matching BTC trade"),
+            ("maker_open", "filled maker oid remains"),
+        )
+        for change, message in cases:
+            with self.subTest(change=change):
+                http, ws = self.dependencies([trade_event(sequence=5)] if change == "duplicate" else None)
+                if change == "wrong_price":
+                    ws.events[-1]["data"][0]["px"] = "100000.1"
+                elif change == "maker_open":
+                    http.bodies[-1] = [{"oid": 7}]
+                with self.assertRaisesRegex(probe.ProbeFailure, message):
+                    self.run_flow(http, ws)
+
+
 class RealOfflineProcessTest(unittest.TestCase):
-    def test_current_offline_binary_passes_probe_b1(self):
+    def test_current_offline_binary_passes_default_b1_and_trade_flow(self):
         binary = Path(os.environ.get("SIM_SERVER_BIN", ROOT / "target" / "debug" / "sim-server"))
         self.assertTrue(binary.is_file(), f"current binary missing; run cargo build --bin sim-server: {binary}")
         reservation = socket.socket()
@@ -342,6 +415,33 @@ class RealOfflineProcessTest(unittest.TestCase):
             self.assertEqual(summary["counts"], {"placements": 1, "cancels": 1})
             self.assertIn("placement_update", summary["checks"])
             self.assertIn("cancel_update", summary["checks"])
+
+            traded = subprocess.run(
+                [
+                    sys.executable,
+                    str(ACCEPTANCE / "probe.py"),
+                    "--base-url",
+                    f"http://127.0.0.1:{port}",
+                    "--ws-url",
+                    f"ws://127.0.0.1:{port}/ws",
+                    "--timeout",
+                    "2",
+                    "--trade-flow",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(traded.returncode, 0, traded.stderr)
+            trade_lines = traded.stdout.splitlines()
+            self.assertEqual(len(trade_lines), 1, traded.stdout)
+            trade_summary = json.loads(trade_lines[0])
+            self.assertEqual(trade_summary["result"], "PASS")
+            self.assertEqual(trade_summary["probe"], "B2a")
+            self.assertEqual(trade_summary["trades"], 1)
+            self.assertIs(trade_summary["maker_price"], True)
         finally:
             if server.poll() is None:
                 server.send_signal(signal.SIGTERM)

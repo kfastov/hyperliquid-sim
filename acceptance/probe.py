@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stdlib-only external Probe-B1 for transport plus one-user state acceptance.
+"""Stdlib-only external Probe-A/B1 plus an explicit narrow trade flow.
 
-The default (or explicit ``--state-flow``) places and cancels one resting BTC
-GTC order. ``--basic-only`` preserves the Probe-A transport/snapshot path.
+The default (or explicit ``--state-flow``) preserves Probe-B1 placement/cancel.
+``--trade-flow`` runs one maker/taker BTC match, while ``--basic-only`` runs
+only the Probe-A transport/snapshot path.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from typing import Any, Optional
 from urllib import error, parse, request
 
 DEFAULT_USER = "0x1111111111111111111111111111111111111111"
+DEFAULT_TAKER = "0x2222222222222222222222222222222222222222"
 SIGNATURE_COMPONENT = "0x" + "a" * 64
 DEFAULT_TIMEOUT = 5.0
 MAX_TIMEOUT = 30.0
@@ -30,6 +32,7 @@ MAX_HTTP_BODY = 1 << 20
 MAX_WS_PAYLOAD = 1 << 20
 MAX_HANDSHAKE = 16 << 10
 MAX_FILTERED_MESSAGES = 16
+DUPLICATE_WINDOW = 0.25
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CANONICAL_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 NORMALIZED_USER = re.compile(r"^0x[0-9a-f]{40}$")
@@ -41,6 +44,10 @@ class ProbeFailure(RuntimeError):
 
 class WebSocketEOF(ProbeFailure):
     """Peer closed the transport while a frame was being read."""
+
+
+class WebSocketTimeout(ProbeFailure):
+    """A bounded WebSocket poll found no complete frame."""
 
 
 @dataclass(frozen=True)
@@ -283,7 +290,7 @@ class WebSocketClient:
             try:
                 opcode, payload = read_server_frame(self.sock)
             except socket.timeout as exc:
-                raise ProbeFailure("WebSocket receive timed out") from exc
+                raise WebSocketTimeout("WebSocket receive timed out") from exc
             if opcode == 0x9:
                 self.sock.sendall(encode_client_frame(payload, 0xA))
                 continue
@@ -299,6 +306,16 @@ class WebSocketClient:
             return json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProbeFailure("WebSocket text frame contains invalid JSON") from exc
+
+    def poll_json(self, timeout: float) -> Any:
+        previous = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        try:
+            return self.receive_json()
+        except WebSocketTimeout:
+            return None
+        finally:
+            self.sock.settimeout(previous)
 
     def expect_pong(self, expected: bytes) -> None:
         opcode, payload = self.receive()
@@ -357,6 +374,16 @@ def subscribe(ws: WebSocketClient, subscription: dict[str, Any], channel: str) -
     require(isinstance(snapshot, dict) and snapshot.get("channel") == channel, f"missing {channel} snapshot")
     require(type(snapshot.get("sequence")) is int, f"{channel} snapshot lacks integer sequence")
     return snapshot
+
+
+def subscribe_ack_only(ws: WebSocketClient, subscription: dict[str, Any], channel: str) -> None:
+    ws.send_text_json({"method": "subscribe", "subscription": subscription})
+    ack = ws.receive_json()
+    expected = {
+        "channel": "subscriptionResponse",
+        "data": {"method": "subscribe", "subscription": subscription},
+    }
+    require(ack == expected, f"{channel} acknowledgement mismatch: {ack!r}")
 
 
 def require_canonical(value: Any, expected: str, label: str) -> None:
@@ -486,6 +513,158 @@ def run_state_flow(
         raise
 
 
+def _trade_payload(message: Any, previous_sequence: int) -> tuple[int, list[Any]] | None:
+    if not isinstance(message, dict) or message.get("channel") != "trades":
+        return None
+    require(set(message) == {"channel", "sequence", "data"}, "trades envelope shape mismatch")
+    sequence = message["sequence"]
+    require(
+        type(sequence) is int and sequence > 0 and sequence > previous_sequence,
+        "trades sequence is not nonzero and monotonic",
+    )
+    data = message["data"]
+    require(isinstance(data, list), "trades data must be a list")
+    return sequence, data
+
+
+def _validate_matching_trade(message: Any, previous_sequence: int) -> tuple[int, int] | None:
+    payload = _trade_payload(message, previous_sequence)
+    if payload is None:
+        return None
+    sequence, data = payload
+    btc = [item for item in data if isinstance(item, dict) and item.get("coin") == "BTC"]
+    if not btc:
+        return sequence, 0
+    require(len(data) == 1 and len(btc) == 1, "matching BTC trade event cardinality mismatch")
+    trade = btc[0]
+    require(
+        set(trade) == {"coin", "side", "px", "sz", "time", "tid"},
+        f"matching BTC trade shape mismatch: {trade!r}",
+    )
+    require(trade["coin"] == "BTC", "matching trade asset mismatch")
+    require(trade["side"] == "B", "matching trade side mismatch")
+    require(type(trade["time"]) is int, "matching trade time mismatch")
+    require(type(trade["tid"]) is int and trade["tid"] > 0, "matching trade id mismatch")
+    require_canonical(trade["px"], "100000", "maker price")
+    require_canonical(trade["sz"], "0.00001", "trade quantity")
+    return sequence, trade["tid"]
+
+
+def _receive_matching_trade(ws: WebSocketClient) -> tuple[int, int]:
+    previous_sequence = 0
+    for _ in range(MAX_FILTERED_MESSAGES):
+        result = _validate_matching_trade(ws.receive_json(), previous_sequence)
+        if result is None:
+            continue
+        previous_sequence, tid = result
+        if tid:
+            return previous_sequence, tid
+    raise ProbeFailure(f"missing matching BTC trade within {MAX_FILTERED_MESSAGES} filtered reads")
+
+
+def _require_no_duplicate_trade(
+    ws: WebSocketClient,
+    sequence: int,
+    tid: int,
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + min(DUPLICATE_WINDOW, timeout)
+    for _ in range(MAX_FILTERED_MESSAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        message = ws.poll_json(remaining)
+        if message is None:
+            return
+        result = _validate_matching_trade(message, sequence)
+        if result is None:
+            continue
+        sequence, next_tid = result
+        if next_tid == tid:
+            raise ProbeFailure("duplicate matching BTC trade")
+    raise ProbeFailure("duplicate check exceeded bounded filtered-message allowance")
+
+
+def run_trade_flow(
+    http: HttpClient,
+    ws_url: str,
+    timeout: float,
+    maker: str,
+    taker: str,
+    websocket_factory: Any = WebSocketClient,
+) -> dict[str, Any]:
+    require(maker != taker, "maker and taker must be distinct")
+    require(
+        NORMALIZED_USER.fullmatch(maker) is not None and NORMALIZED_USER.fullmatch(taker) is not None,
+        "trade users must be normalized lowercase addresses",
+    )
+    ws = websocket_factory(ws_url, timeout, None)
+    try:
+        subscribe_ack_only(ws, {"type": "trades", "coin": "BTC"}, "trades")
+
+        maker_action = {
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": False, "p": "100000", "s": "0.00001", "r": False,
+                "t": {"limit": {"tif": "Gtc"}},
+            }],
+            "grouping": "na",
+        }
+        placed = require_ok(
+            http.post_json("/exchange", exchange_envelope(maker_action, 2000), maker),
+            "maker BTC GTC placement",
+        )
+        maker_status = ordered_status(placed, "order", "maker BTC GTC placement")
+        require(isinstance(maker_status, dict) and set(maker_status) == {"resting"}, "maker did not rest")
+        resting = maker_status["resting"]
+        require(
+            isinstance(resting, dict) and set(resting) == {"oid"} and type(resting["oid"]) is int,
+            "maker resting oid shape mismatch",
+        )
+        maker_oid = resting["oid"]
+
+        taker_action = {
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": True, "p": "100000", "s": "0.00001", "r": False,
+                "t": {"limit": {"tif": "Ioc"}},
+            }],
+            "grouping": "na",
+        }
+        crossed = require_ok(
+            http.post_json("/exchange", exchange_envelope(taker_action, 2001), taker),
+            "taker BTC IOC crossing placement",
+        )
+        taker_status = ordered_status(crossed, "order", "taker BTC IOC crossing placement")
+        require(isinstance(taker_status, dict) and set(taker_status) == {"filled"}, "taker did not fill")
+        filled = taker_status["filled"]
+        require(
+            isinstance(filled, dict) and set(filled) == {"totalSz", "avgPx", "oid"},
+            "taker filled status shape mismatch",
+        )
+        require(type(filled["oid"]) is int and filled["oid"] != maker_oid, "taker oid mismatch")
+        require_canonical(filled["totalSz"], "0.00001", "HTTP filled quantity")
+        require_canonical(filled["avgPx"], "100000", "HTTP maker price")
+
+        sequence, tid = _receive_matching_trade(ws)
+        _require_no_duplicate_trade(ws, sequence, tid, timeout)
+
+        open_orders = require_ok(
+            http.post_json("/info", {"type": "openOrders", "user": maker}, maker),
+            "maker openOrders after fill",
+        )
+        require(isinstance(open_orders, list), "maker openOrders response is not a list")
+        require(
+            all(not isinstance(order, dict) or order.get("oid") != maker_oid for order in open_orders),
+            "filled maker oid remains in openOrders",
+        )
+        ws.close_cleanly()
+        return {"trades": 1, "maker_price": True}
+    except Exception:
+        ws.abort()
+        raise
+
+
 def run_basic_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str, Any]:
     started = time.monotonic()
     http = HttpClient(base_url, timeout)
@@ -560,23 +739,40 @@ def run_probe(
     timeout: float,
     user: str,
     basic_only: bool = False,
+    trade_flow: bool = False,
+    taker: str = DEFAULT_TAKER,
 ) -> dict[str, Any]:
     started = time.monotonic()
     summary = run_basic_probe(base_url, ws_url, timeout, user)
     if basic_only:
         return summary
-    summary["probe"] = "B1"
-    summary["counts"] = run_state_flow(HttpClient(base_url, timeout), ws_url, timeout, user)
-    summary["checks"].extend([
-        "ordered_placement_response",
-        "placement_update",
-        "open_orders_contains_oid",
-        "canonical_decimals",
-        "monotonic_event_sequence",
-        "ordered_cancel_response",
-        "cancel_update",
-        "open_orders_empty_after_cancel",
-    ])
+    if trade_flow:
+        summary["probe"] = "B2a"
+        summary.update(run_trade_flow(HttpClient(base_url, timeout), ws_url, timeout, user, taker))
+        summary["checks"].extend([
+            "maker_resting_status",
+            "exact_order_status_cardinality",
+            "taker_crossing_fill",
+            "matching_btc_trade",
+            "maker_execution_price",
+            "canonical_trade_quantity",
+            "nonzero_monotonic_trade_sequence",
+            "no_duplicate_matching_trade",
+            "filled_maker_oid_absent_from_open_orders",
+        ])
+    else:
+        summary["probe"] = "B1"
+        summary["counts"] = run_state_flow(HttpClient(base_url, timeout), ws_url, timeout, user)
+        summary["checks"].extend([
+            "ordered_placement_response",
+            "placement_update",
+            "open_orders_contains_oid",
+            "canonical_decimals",
+            "monotonic_event_sequence",
+            "ordered_cancel_response",
+            "cancel_update",
+            "open_orders_empty_after_cancel",
+        ])
     summary["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     return summary
 
@@ -596,19 +792,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--base-url", required=True, help="HTTP(S) service origin")
     parser.add_argument("--ws-url", required=True, help="WS(S) service endpoint")
     parser.add_argument("--timeout", type=bounded_timeout, default=DEFAULT_TIMEOUT, help="per-I/O timeout in seconds (0.1-30)")
-    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user for private state")
+    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user (maker for --trade-flow)")
+    parser.add_argument("--taker", default=DEFAULT_TAKER, help="normalized synthetic taker for --trade-flow")
     flow = parser.add_mutually_exclusive_group()
+    flow.add_argument("--trade-flow", action="store_true", help="run the narrow Probe-B2a maker/taker trades path")
     flow.add_argument("--state-flow", action="store_true", help="explicitly run the default one-user placement/cancel flow")
     flow.add_argument("--basic-only", action="store_true", help="run Probe-A transport/snapshots without changing state")
     args = parser.parse_args(argv)
     try:
-        _validate_header_value(args.user, "user")
-        require(NORMALIZED_USER.fullmatch(args.user) is not None, "user must be a normalized lowercase 0x address")
-        summary = run_probe(args.base_url, args.ws_url, args.timeout, args.user, args.basic_only)
+        for label, user in (("user", args.user), ("taker", args.taker)):
+            _validate_header_value(user, label)
+            require(NORMALIZED_USER.fullmatch(user) is not None, f"{label} must be a normalized lowercase 0x address")
+        summary = run_probe(
+            args.base_url,
+            args.ws_url,
+            args.timeout,
+            args.user,
+            args.basic_only,
+            args.trade_flow,
+            args.taker,
+        )
     except Exception as exc:
+        failed_probe = "A" if args.basic_only else ("B2a" if args.trade_flow else "B1")
         print(
             json.dumps(
-                {"result": "FAIL", "probe": "A" if args.basic_only else "B1", "error": type(exc).__name__, "message": str(exc)},
+                {"result": "FAIL", "probe": failed_probe, "error": type(exc).__name__, "message": str(exc)},
                 separators=(",", ":"),
                 sort_keys=True,
             ),
