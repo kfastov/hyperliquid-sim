@@ -832,6 +832,7 @@ pub struct OracleOrchestrator<F, S, J, C> {
     clock: C,
     backoff: ReconnectBackoff,
     scales: PriceScales,
+    primary_completeness_timeout: Duration,
 }
 
 impl<F, S, J, C> OracleOrchestrator<F, S, J, C>
@@ -850,12 +851,30 @@ where
         backoff: ReconnectBackoff,
         scales: PriceScales,
     ) -> Self {
-        Self { factory, sleeper, jitter, clock, backoff, scales }
+        Self {
+            factory,
+            sleeper,
+            jitter,
+            clock,
+            backoff,
+            scales,
+            primary_completeness_timeout: Duration::from_secs(40),
+        }
+    }
+
+    /// Overrides the absolute window in which a fresh primary connection must
+    /// produce at least one valid observation for every fixed asset.
+    #[must_use]
+    pub fn with_primary_completeness_timeout(mut self, timeout: Duration) -> Self {
+        self.primary_completeness_timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// Runs until cancellation or until the bounded observation consumer closes.
-    /// Every failed connect/read marks all assets unavailable, immediately tries
-    /// the fixed HTTP fallback, sleeps once, and then creates a fresh transport.
+    /// Every failed connect/read marks all assets unavailable. A primary that is
+    /// still incomplete at its absolute deadline marks only its missing assets
+    /// unavailable. Both transitions immediately try the fixed HTTP fallback,
+    /// sleep once, and then create a fresh transport.
     pub async fn run(
         mut self,
         output: tokio::sync::mpsc::Sender<OracleIngestEvent>,
@@ -870,18 +889,38 @@ where
                 None => return OrchestratorExit::Shutdown,
             };
 
+            let mut unavailable = [true; 3];
             if connected {
+                let mut coverage = [false; 3];
+                let mut primary_recovered = false;
+                let completeness_deadline =
+                    tokio::time::Instant::now() + self.primary_completeness_timeout;
                 loop {
                     let candidate = sequence.saturating_add(1);
-                    let read = until_shutdown(
-                        &mut shutdown,
-                        transport.next_active_asset_ctx(candidate, self.scales),
-                    )
-                    .await;
+                    let read = if coverage.into_iter().all(|covered| covered) {
+                        until_shutdown(
+                            &mut shutdown,
+                            transport.next_active_asset_ctx(candidate, self.scales),
+                        )
+                        .await
+                        .map(DeadlineResult::Completed)
+                    } else {
+                        until_shutdown_or_deadline(
+                            &mut shutdown,
+                            completeness_deadline,
+                            transport.next_active_asset_ctx(candidate, self.scales),
+                        )
+                        .await
+                    };
                     match read {
                         None => return OrchestratorExit::Shutdown,
-                        Some(Ok(observation)) => {
+                        Some(DeadlineResult::Deadline) => {
+                            unavailable = coverage.map(|covered| !covered);
+                            break;
+                        }
+                        Some(DeadlineResult::Completed(Ok(observation))) => {
                             sequence = candidate;
+                            coverage[usize::from(observation.asset.value())] = true;
                             if send_event(
                                 &output,
                                 &mut shutdown,
@@ -892,17 +931,23 @@ where
                             {
                                 return exit_for(&shutdown);
                             }
-                            // A connection is not considered recovered until it yields
-                            // its first valid WS observation.
-                            self.backoff.reset();
+                            // Fallback data does not recover the primary. Only complete
+                            // coverage on this fresh socket resets reconnect state.
+                            if !primary_recovered && coverage.into_iter().all(|covered| covered) {
+                                self.backoff.reset();
+                                primary_recovered = true;
+                            }
                         }
-                        Some(Err(_)) => break,
+                        Some(DeadlineResult::Completed(Err(_))) => break,
                     }
                 }
             }
 
             let unavailable_at_ms = self.clock.now_ms();
             for asset in AssetId::ALL {
+                if !unavailable[usize::from(asset.value())] {
+                    continue;
+                }
                 if send_event(
                     &output,
                     &mut shutdown,
@@ -942,7 +987,10 @@ where
             }
 
             let base = self.backoff.next_delay();
-            let delay = self.jitter.apply(base).min(self.backoff.maximum_delay());
+            let delay = self
+                .jitter
+                .apply(base)
+                .clamp(Duration::from_millis(1), self.backoff.maximum_delay());
             if until_shutdown(&mut shutdown, self.sleeper.sleep(delay)).await.is_none() {
                 return OrchestratorExit::Shutdown;
             }
@@ -960,6 +1008,36 @@ async fn send_event(
     event: OracleIngestEvent,
 ) -> Option<()> {
     until_shutdown(shutdown, output.send(event)).await.and_then(Result::ok)
+}
+
+enum DeadlineResult<T> {
+    Completed(T),
+    Deadline,
+}
+
+async fn until_shutdown_or_deadline<F: Future>(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Option<DeadlineResult<F::Output>> {
+    tokio::pin!(future);
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
+    loop {
+        if *shutdown.borrow() {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return None;
+                }
+            }
+            () = &mut sleep => return Some(DeadlineResult::Deadline),
+            result = &mut future => return Some(DeadlineResult::Completed(result)),
+        }
+    }
 }
 
 async fn until_shutdown<F: Future>(
