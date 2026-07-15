@@ -332,6 +332,52 @@ async fn malformed_json_and_signature_are_invalid_request() {
 }
 
 #[tokio::test]
+async fn exact_shape_unknown_assets_are_unsupported_and_bad_shapes_stay_invalid() {
+    let app = app(runtime(), market(None), 8);
+
+    for coin in ["DOGE", "", "btc"] {
+        let (status, body) =
+            post(app.clone(), "/info", json!({"type":"l2Book","coin":coin}), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["category"], "unsupported", "coin={coin}, body={body}");
+    }
+    for request in [
+        json!({"type":"l2Book"}),
+        json!({"type":"l2Book","coin":3}),
+        json!({"type":"l2Book","coin":"DOGE","extra":true}),
+    ] {
+        let (_, body) = post(app.clone(), "/info", request, None).await;
+        assert_eq!(body["error"]["category"], "invalid_request", "body={body}");
+    }
+
+    for asset in [3_u8, 255] {
+        for action in [
+            json!({"type":"order","orders":[order(asset,true,"1","0.00001","Gtc")],"grouping":"na"}),
+            json!({"type":"cancel","cancels":[{"a":asset,"o":1}]}),
+        ] {
+            let (_, body) = post(app.clone(), "/exchange", exchange(action), Some(ALICE)).await;
+            assert_eq!(body["error"]["category"], "unsupported", "body={body}");
+        }
+    }
+
+    let malformed_actions = [
+        json!({"type":"cancel","cancels":[{"o":1}]}),
+        json!({"type":"cancel","cancels":[{"a":"3","o":1}]}),
+        json!({"type":"cancel","cancels":[{"a":3.0,"o":1}]}),
+        json!({"type":"cancel","cancels":[{"a":256,"o":1}]}),
+        json!({"type":"cancel","cancels":[{"a":-1,"o":1}]}),
+        json!({"type":"cancel","cancels":[{"a":3,"o":1,"extra":true}]}),
+        json!({"type":"order","orders":[{"a":3}],"grouping":"na"}),
+        json!({"type":"order","orders":[order(3,true,"1.0","0.00001","Gtc")],"grouping":"na"}),
+        json!({"type":"order","orders":[order(3,true,"1","0.00001","Gtc")],"grouping":"na","extra":true}),
+    ];
+    for action in malformed_actions {
+        let (_, body) = post(app.clone(), "/exchange", exchange(action), Some(ALICE)).await;
+        assert_eq!(body["error"]["category"], "invalid_request", "body={body}");
+    }
+}
+
+#[tokio::test]
 async fn json_media_type_and_body_failures_have_stable_http_errors() {
     let app = app_with_config(
         runtime(),

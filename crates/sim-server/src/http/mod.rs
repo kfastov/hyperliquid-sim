@@ -11,9 +11,12 @@ use axum::{
 };
 use hl_wire::{
     AssetId, DecimalScale, PriceTicks, QtyLots, SimUserId,
-    api::{ErrorCategory, ExchangeAction, ExchangeEnvelope, InfoRequest, OrderType},
+    api::{
+        Cloid, ErrorCategory, ExchangeAction, ExchangeEnvelope, Grouping, InfoRequest, OrderType,
+        PositiveDecimal, Signature,
+    },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sim_core::{
     ApplyResult, CancelOrder, CancelStatus, Command, CommandResult, OrderSnapshot, OrderState,
@@ -84,6 +87,59 @@ enum ExpectedAction {
 
 type ApiResponse = (StatusCode, Json<Value>);
 
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum RawL2BookRequest {
+    #[serde(rename = "l2Book")]
+    L2Book { coin: String },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawExchangeEnvelope {
+    action: RawExchangeAction,
+    nonce: u64,
+    signature: Signature,
+    vault_address: Option<SimUserId>,
+    #[serde(default)]
+    expires_after: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum RawExchangeAction {
+    Order { orders: Vec<RawOrderRequest>, grouping: Grouping },
+    Cancel { cancels: Vec<RawCancelRequest> },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOrderRequest {
+    #[serde(rename = "a")]
+    asset: u8,
+    #[serde(rename = "b")]
+    is_buy: bool,
+    #[serde(rename = "p")]
+    limit_px: PositiveDecimal,
+    #[serde(rename = "s")]
+    size: PositiveDecimal,
+    #[serde(rename = "r")]
+    reduce_only: bool,
+    #[serde(rename = "t")]
+    order_type: OrderType,
+    #[serde(rename = "c", default)]
+    cloid: Option<Cloid>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCancelRequest {
+    #[serde(rename = "a")]
+    asset: u8,
+    #[serde(rename = "o")]
+    order_id: u64,
+}
+
 /// Builds the complete HTTP router with explicitly injected bounded seams.
 pub fn router_with_config(
     runtime: Arc<dyn RuntimePort>,
@@ -133,6 +189,9 @@ async fn info(
     }
     let request: InfoRequest = match serde_json::from_value(value) {
         Ok(request) => request,
+        Err(_) if exact_unknown_info_asset(&body) => {
+            return error(StatusCode::BAD_REQUEST, ErrorCategory::Unsupported, "unsupported asset");
+        }
         Err(_) => return invalid("invalid info request"),
     };
 
@@ -232,6 +291,9 @@ async fn exchange(
     }
     let envelope: ExchangeEnvelope = match serde_json::from_value(value) {
         Ok(envelope) => envelope,
+        Err(_) if exact_unknown_exchange_asset(&body) => {
+            return error(StatusCode::BAD_REQUEST, ErrorCategory::Unsupported, "unsupported asset");
+        }
         Err(_) => return invalid("invalid exchange request"),
     };
     if envelope.vault_address.is_some() {
@@ -541,6 +603,41 @@ fn authority(headers: &HeaderMap) -> Result<SimUserId, ApiResponse> {
 
 fn decode_json(body: &[u8]) -> Result<Value, ApiResponse> {
     serde_json::from_slice(body).map_err(|_| invalid("malformed JSON request"))
+}
+
+fn exact_unknown_info_asset(body: &[u8]) -> bool {
+    let Ok(RawL2BookRequest::L2Book { coin }) = serde_json::from_slice(body) else {
+        return false;
+    };
+    AssetId::from_symbol(&coin).is_err()
+}
+
+fn exact_unknown_exchange_asset(body: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<RawExchangeEnvelope>(body) else {
+        return false;
+    };
+    let _syntax =
+        (envelope.nonce, envelope.signature, envelope.vault_address, envelope.expires_after);
+    match envelope.action {
+        RawExchangeAction::Order { orders, grouping } => {
+            let _grouping = grouping;
+            orders.into_iter().any(|order| {
+                let _syntax = (
+                    order.is_buy,
+                    order.limit_px,
+                    order.size,
+                    order.reduce_only,
+                    order.order_type,
+                    order.cloid,
+                );
+                order.asset > AssetId::SOL.value()
+            })
+        }
+        RawExchangeAction::Cancel { cancels } => cancels.into_iter().any(|cancel| {
+            let _order_id = cancel.order_id;
+            cancel.asset > AssetId::SOL.value()
+        }),
+    }
 }
 
 fn has_json_content_type(headers: &HeaderMap) -> bool {
