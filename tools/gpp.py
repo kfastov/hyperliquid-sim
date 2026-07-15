@@ -105,7 +105,10 @@ def git_blob(root: Path, revision: str, rel: str) -> str:
 
 def gh_json(args: list[str], cwd: Path) -> Any:
     out = run("gh", *args, cwd=cwd)
-    return json.loads(out)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise ProtocolError(f"invalid JSON from gh {' '.join(args)}: {exc}") from exc
 
 
 def issue_data(root: Path, issue: int) -> dict[str, Any]:
@@ -210,9 +213,76 @@ def changed_files(root: Path, base_sha: str, head_sha: str) -> list[str]:
 
 def validate_dependencies(root: Path, dependencies: list[int]) -> None:
     for dep in dependencies:
-        data = gh_json(["issue", "view", str(dep), "--json", "state,closedByPullRequestsReferences"], root)
-        merged = any(pr.get("mergedAt") for pr in data.get("closedByPullRequestsReferences") or [])
-        require(data.get("state") == "CLOSED" and merged, f"dependency #{dep} is not accepted by merged PR")
+        try:
+            issue = gh_json(
+                ["issue", "view", str(dep), "--json", "state,closedByPullRequestsReferences"],
+                root,
+            )
+        except ProtocolError as exc:
+            raise ProtocolError(f"dependency #{dep} lookup failed: {exc}") from exc
+
+        require(isinstance(issue, dict), f"dependency #{dep} Issue has invalid schema: root must be an object")
+        state = issue.get("state")
+        require(isinstance(state, str), f"dependency #{dep} Issue has invalid schema: state must be a string")
+        require(state == "CLOSED", f"dependency #{dep} Issue is not closed")
+
+        references = issue.get("closedByPullRequestsReferences")
+        require(
+            isinstance(references, list),
+            f"dependency #{dep} Issue has invalid schema: closedByPullRequestsReferences must be an array",
+        )
+        pr_numbers: list[int] = []
+        for reference in references:
+            require(
+                isinstance(reference, dict),
+                f"dependency #{dep} Issue has invalid schema: linked PR reference must be an object",
+            )
+            number = reference.get("number")
+            require(
+                isinstance(number, int) and not isinstance(number, bool) and number > 0,
+                f"dependency #{dep} Issue has invalid schema: linked PR number must be a positive integer",
+            )
+            pr_numbers.append(number)
+
+        merged = False
+        for number in pr_numbers:
+            try:
+                pr = gh_json(
+                    ["pr", "view", str(number), "--json", "state,mergedAt,mergeCommit"],
+                    root,
+                )
+            except ProtocolError as exc:
+                raise ProtocolError(f"dependency #{dep} linked PR #{number} lookup failed: {exc}") from exc
+
+            require(
+                isinstance(pr, dict),
+                f"dependency #{dep} linked PR #{number} has invalid schema: root must be an object",
+            )
+            pr_state = pr.get("state")
+            merged_at = pr.get("mergedAt")
+            merge_commit = pr.get("mergeCommit")
+            valid_commit = merge_commit is None or (
+                isinstance(merge_commit, dict)
+                and isinstance(merge_commit.get("oid"), str)
+                and bool(merge_commit["oid"])
+            )
+            require(
+                isinstance(pr_state, str)
+                and pr_state in {"OPEN", "CLOSED", "MERGED"}
+                and "mergedAt" in pr
+                and (merged_at is None or (isinstance(merged_at, str) and bool(merged_at)))
+                and "mergeCommit" in pr
+                and valid_commit,
+                f"dependency #{dep} linked PR #{number} has invalid schema",
+            )
+            merged = merged or (
+                pr_state == "MERGED"
+                and isinstance(merged_at, str)
+                and bool(merged_at)
+                and isinstance(merge_commit, dict)
+            )
+
+        require(merged, f"dependency #{dep} is not accepted by merged PR")
 
 
 def validate_unique_pr(root: Path, task: int, current_number: int) -> None:
