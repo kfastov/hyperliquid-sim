@@ -28,8 +28,8 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt, io,
     process::ExitCode,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant as StdInstant},
 };
 use tokio::{
     net::TcpListener,
@@ -183,18 +183,55 @@ fn project_market_snapshot(
 struct LifecycleSnapshotView {
     state: Arc<LifecycleState>,
     projection: Mutex<ProjectionCache>,
+    projection_advanced: Condvar,
+    projection_wait: Duration,
 }
 
 impl LifecycleSnapshotView {
-    fn new(state: Arc<LifecycleState>, snapshot: EngineSnapshot, capacity: usize) -> Arc<Self> {
-        Arc::new(Self { state, projection: Mutex::new(ProjectionCache::new(snapshot, capacity)) })
+    fn new(
+        state: Arc<LifecycleState>,
+        snapshot: EngineSnapshot,
+        capacity: usize,
+        projection_wait: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state,
+            projection: Mutex::new(ProjectionCache::new(snapshot, capacity)),
+            projection_advanced: Condvar::new(),
+            projection_wait,
+        })
     }
 
     fn project(&self, record: &EventRecord) -> Result<ProjectedEvent, ViewError> {
-        self.projection
+        let projected = self
+            .projection
             .lock()
             .map_err(|_| ViewError::new("projection cache unavailable"))?
-            .project(record)
+            .project(record);
+        self.projection_advanced.notify_all();
+        projected
+    }
+
+    fn project_for_delivery(&self, record: &EventRecord) -> Result<ProjectedEvent, ViewError> {
+        let mut projection =
+            self.projection.lock().map_err(|_| ViewError::new("projection cache unavailable"))?;
+        let deadline = StdInstant::now() + self.projection_wait;
+        while record.sequence > projection.sequence.saturating_add(1) {
+            let remaining = deadline
+                .checked_duration_since(StdInstant::now())
+                .ok_or_else(|| ViewError::new("event projection sequence gap"))?;
+            let (next, wait) = self
+                .projection_advanced
+                .wait_timeout(projection, remaining)
+                .map_err(|_| ViewError::new("projection cache unavailable"))?;
+            projection = next;
+            if wait.timed_out() && record.sequence > projection.sequence.saturating_add(1) {
+                return Err(ViewError::new("event projection sequence gap"));
+            }
+        }
+        let projected = projection.project(record);
+        self.projection_advanced.notify_all();
+        projected
     }
 }
 
@@ -406,7 +443,7 @@ impl SnapshotView for LifecycleSnapshotView {
         subscription: &Subscription,
         record: &EventRecord,
     ) -> Result<Option<ViewMessage>, ViewError> {
-        let projected = self.project(record)?;
+        let projected = self.project_for_delivery(record)?;
         let message = match subscription {
             // Runtime EventRecord currently represents engine transitions only;
             // oracle observations have no compatible sequenced runtime event.
@@ -444,7 +481,7 @@ async fn refresh_snapshot_view(
             RuntimeReply::EngineSnapshot(snapshot) => snapshot,
             _ => return Err(LifecycleError::UnexpectedRuntimeReply),
         };
-    let view = LifecycleSnapshotView::new(state, snapshot, capacity);
+    let view = LifecycleSnapshotView::new(state, snapshot, capacity, bound);
     let projector = Arc::clone(&view);
     tokio::spawn(async move {
         while let Ok(event) = events.recv().await {
@@ -1216,9 +1253,10 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use hl_wire::{QtyLots, SimUserId};
     use http_body_util::BodyExt;
     use oracle_hyperliquid::{OracleFreshness, OracleTransport};
-    use sim_core::Engine;
+    use sim_core::{Engine, TimeInForce};
     use sim_server::runtime::{OracleAssetHealth, RuntimeOracleHealth};
     use sim_server::{RuntimeReply, bounded_runtime};
     use std::{num::NonZeroUsize, sync::Mutex};
@@ -1236,7 +1274,64 @@ mod tests {
 
     fn test_snapshot_view(state: Arc<LifecycleState>) -> Arc<dyn SnapshotView> {
         let snapshot = Engine::new(7).snapshot();
-        LifecycleSnapshotView::new(state, snapshot, 16)
+        LifecycleSnapshotView::new(state, snapshot, 16, Duration::from_millis(500))
+    }
+
+    fn accepted_order_record(sequence: u64, order_id: u64, user: &str) -> EventRecord {
+        EventRecord {
+            sequence,
+            timestamp: sequence,
+            event: Event::OrderAccepted {
+                order: OrderSnapshot {
+                    id: order_id,
+                    user: SimUserId::parse(user).expect("test user"),
+                    asset: AssetId::BTC,
+                    side: Side::Bid,
+                    price: PriceTicks::new(1_000_000).expect("test price"),
+                    quantity: QtyLots::new(1).expect("test quantity"),
+                    remaining_lots: 1,
+                    time_in_force: TimeInForce::Gtc,
+                    client_order_id: None,
+                    accepted_sequence: sequence,
+                    state: OrderState::Open,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn private_delivery_waits_for_interleaved_unrelated_event_projection() {
+        const ALICE: &str = "0x1111111111111111111111111111111111111111";
+        const BOB: &str = "0x2222222222222222222222222222222222222222";
+
+        let view = LifecycleSnapshotView::new(
+            LifecycleState::new(true),
+            Engine::new(7).snapshot(),
+            16,
+            Duration::from_millis(250),
+        );
+        view.project(&accepted_order_record(1, 1, ALICE)).expect("first projection");
+
+        let projector = Arc::clone(&view);
+        let interleaved = accepted_order_record(2, 2, BOB);
+        let projector_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            projector.project(&interleaved).expect("interleaved projection");
+        });
+
+        let delivered = view
+            .update(
+                &Subscription::OrderUpdates { user: SimUserId::parse(ALICE).expect("alice user") },
+                &accepted_order_record(3, 3, ALICE),
+            )
+            .expect("delivery waits for projector")
+            .expect("alice update");
+        projector_thread.join().expect("projector thread");
+
+        assert_eq!(delivered.channel, EventChannel::OrderUpdates);
+        assert_eq!(delivered.sequence, 3);
+        assert_eq!(delivered.data[0]["order"]["oid"], 3);
+        assert_eq!(delivered.data[0]["status"], "open");
     }
 
     async fn runtime_request(runtime: &dyn RuntimePort, request: RuntimeRequest) -> RuntimeReply {
