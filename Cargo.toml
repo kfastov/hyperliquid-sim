@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/hl-wire",
+    "crates/sim-core",
+    "crates/sim-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+hl-wire = { path = "crates/hl-wire" }
+sim-core = { path = "crates/sim-core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
