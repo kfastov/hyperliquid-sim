@@ -1,0 +1,57 @@
+{
+  "protocol": "gpp/0.1",
+  "issue": 4,
+  "objective": "Implement the sim-header-v1 /ws adapter with explicit subscribe/unsubscribe acknowledgements, ping/pong, bounded non-blocking fan-out, initial snapshots, gap-observable event sequences, and the allMids, l2Book, trades, and user-filtered orderUpdates subscriptions.",
+  "scope": {
+    "write": [
+      "crates/sim-server/src/ws/**",
+      "crates/sim-server/tests/ws/**"
+    ],
+    "forbidden": [
+      ".github/**",
+      "protocol/**",
+      "tools/gpp.py",
+      "AGENTS.md",
+      "docs/**",
+      "crates/sim-core/**",
+      "crates/oracle-hyperliquid/**",
+      "crates/sim-server/src/http/**",
+      "crates/sim-server/src/runtime/**"
+    ]
+  },
+  "inputs": [
+    "docs/architecture.md",
+    "docs/compatibility.md",
+    "crates/hl-wire/src/lib.rs",
+    "crates/sim-core/src/lib.rs",
+    "crates/sim-server/src/lib.rs"
+  ],
+  "dependencies": [2],
+  "acceptance": {
+    "commands": [
+      "cargo fmt --all -- --check",
+      "cargo clippy -p sim-server --all-targets -- -D warnings",
+      "cargo test -p sim-server --test ws",
+      "cargo test --workspace",
+      "python3 -m unittest discover -s tests -v",
+      "python3 tools/gpp.py validate-repo"
+    ],
+    "assertions": [
+      "Tests cover subscribe acknowledgements, unsubscribe acknowledgements, ping/pong, initial snapshots where specified, and updates for allMids, l2Book, trades, and orderUpdates.",
+      "orderUpdates requires X-Sim-User at upgrade and never leaks another local user's snapshot or events; public subscriptions do not require user identity.",
+      "Snapshot/event sequencing lets a client detect gaps, and a full or lagging subscriber cannot block the single-owner engine or other subscribers.",
+      "Unsupported subscription and WebSocket post-request variants fail explicitly instead of silently approximating Hyperliquid behavior.",
+      "The adapter uses only shared snapshots/events/commands and adds no oracle ingestion or matching behavior."
+    ]
+  },
+  "deliverables": [
+    "WebSocket control and subscription adapter under crates/sim-server/src/ws",
+    "WebSocket integration fixtures including slow-subscriber and user-isolation tests under crates/sim-server/tests/ws"
+  ],
+  "risks": [
+    "Initial snapshot and event handoff can lose or duplicate updates without an explicit sequence boundary.",
+    "Slow consumers can create backpressure on matching or unbounded memory growth.",
+    "Incorrect user routing can disclose synthetic account activity across simulator users."
+  ],
+  "notes": "WebSocket post requests are outside the frozen MVP profile. The task relies on task #2 to pre-establish sim-server dependencies and module exports, avoiding overlap with the HTTP task."
+}
