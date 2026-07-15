@@ -66,7 +66,7 @@ impl SnapshotView for FakeView {
                 10,
                 json!({"coin":coin,"time":1000,"levels":[[],[]]}),
             )),
-            Subscription::OrderUpdates { user } => {
+            Subscription::OrderUpdates { user: _ } => {
                 Some(ViewMessage::new(EventChannel::OrderUpdates, 10, json!([])))
             }
             Subscription::Trades { .. } => None,

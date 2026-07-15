@@ -14,7 +14,7 @@ use hl_wire::response::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use sim_core::EventRecord;
+use sim_core::{Event, EventRecord};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -109,7 +109,6 @@ struct AdapterState {
 }
 
 /// Builds a router exposing exactly `GET /ws`.
-#[must_use]
 pub fn router(
     runtime: Arc<dyn RuntimePort>,
     snapshots: Arc<dyn SnapshotView>,
@@ -318,16 +317,15 @@ fn classify_parse_failure(text: &str) -> &'static str {
     };
     match object.get("method").and_then(Value::as_str) {
         Some("post") => "unsupported",
-        Some("subscribe" | "unsubscribe")
-            if object
-                .get("subscription")
-                .and_then(Value::as_object)
-                .and_then(|subscription| subscription.get("type"))
-                .and_then(Value::as_str)
-                .is_some() =>
+        Some("subscribe" | "unsubscribe") => match object
+            .get("subscription")
+            .and_then(Value::as_object)
+            .and_then(|subscription| subscription.get("type"))
+            .and_then(Value::as_str)
         {
-            "unsupported"
-        }
+            Some("allMids" | "l2Book" | "trades" | "orderUpdates") | None => "invalid_request",
+            Some(_) => "unsupported",
+        },
         Some(method) if !matches!(method, "ping" | "subscribe" | "unsubscribe") => "unsupported",
         _ => "invalid_request",
     }
@@ -351,6 +349,9 @@ fn route_event(
         if active.snapshot_boundary.is_some_and(|boundary| record.sequence <= boundary) {
             continue;
         }
+        if !event_is_visible_to_subscription(&active.request, record) {
+            continue;
+        }
         match state.snapshots.update(&active.request, record) {
             Ok(Some(message)) => {
                 if !send_view(outbound, message) {
@@ -366,6 +367,18 @@ fn route_event(
         }
     }
     true
+}
+
+fn event_is_visible_to_subscription(subscription: &Subscription, record: &EventRecord) -> bool {
+    let Subscription::OrderUpdates { user } = subscription else {
+        return true;
+    };
+    match &record.event {
+        Event::OrderAccepted { order } => &order.user == user,
+        Event::Fill { fill } => &fill.maker == user || &fill.taker == user,
+        Event::OrderUpdated { user: event_user, .. }
+        | Event::OrderCancelled { user: event_user, .. } => event_user == user,
+    }
 }
 
 fn send_ack(
