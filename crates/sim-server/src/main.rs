@@ -8,7 +8,9 @@ use oracle_hyperliquid::{
     OracleOrchestrator, PriceScales, ReconnectBackoff, SystemClock, TokioHyperliquidTransport,
     TokioSleeper, TransportFactory,
 };
-use sim_server::http::{MarketObservation, MarketSnapshot, MarketView, MarketViewError};
+use sim_server::http::{
+    HttpConfig, MarketObservation, MarketSnapshot, MarketView, MarketViewError, router_with_config,
+};
 use sim_server::runtime::actors::SeededLocalActors;
 use sim_server::runtime::{OracleAssetHealth, RuntimeOracleHealth};
 use sim_server::runtime::{RuntimeTask, RuntimeTaskError, start_runtime};
@@ -215,6 +217,15 @@ fn oracle_health_is_ready(health: RuntimeOracleHealth) -> bool {
     })
 }
 
+fn http_config(config: &Config) -> HttpConfig {
+    HttpConfig {
+        max_batch: config.max_batch_size.get(),
+        max_body_bytes: config.max_body_bytes.get(),
+        max_observation_age_ms: MAX_OBSERVATION_AGE_MS,
+        runtime_reply_timeout: config.reply_timeout,
+    }
+}
+
 fn service_router(
     config: &Config,
     runtime: Arc<dyn RuntimePort>,
@@ -224,10 +235,11 @@ fn service_router(
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .with_state(ReadinessState {
-            runtime,
-            market,
+            runtime: Arc::clone(&runtime),
+            market: Arc::clone(&market),
             reply_timeout: (config.reply_timeout / 2).max(Duration::from_millis(1)),
         })
+        .merge(router_with_config(runtime, market, http_config(config)))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, config.reply_timeout))
         .layer(ConcurrencyLimitLayer::new(config.max_concurrent_requests.get()))
 }
@@ -951,6 +963,25 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.expect("readiness body").to_bytes();
         (status, String::from_utf8(body.to_vec()).expect("utf8 readiness body"))
+    }
+
+    #[test]
+    fn validated_http_bounds_map_without_reinterpretation() {
+        let config = Config::from_pairs(&[
+            ("SIM_MAX_BATCH_SIZE", "7"),
+            ("SIM_MAX_BODY_BYTES", "1234"),
+            ("SIM_REPLY_TIMEOUT_MS", "4321"),
+        ])
+        .expect("validated HTTP config");
+        assert_eq!(
+            http_config(&config),
+            HttpConfig {
+                max_batch: 7,
+                max_body_bytes: 1_234,
+                max_observation_age_ms: 60_000,
+                runtime_reply_timeout: Duration::from_millis(4_321),
+            }
+        );
     }
 
     #[tokio::test]

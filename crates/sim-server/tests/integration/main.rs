@@ -8,7 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde_json::{Value, json};
+
 const PROCESS_BOUND: Duration = Duration::from_secs(5);
+const ALICE: &str = "0x1111111111111111111111111111111111111111";
+const BOB: &str = "0x2222222222222222222222222222222222222222";
+const SIG: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct ChildGuard(Child);
 
@@ -60,6 +65,49 @@ fn wait_for_response(address: SocketAddr, path: &str, expected_status: &str) -> 
             Err(error) => panic!("HTTP listener did not start: {error}"),
         }
     }
+}
+
+fn request(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .expect("connect to server");
+    stream.set_read_timeout(Some(PROCESS_BOUND)).expect("set read timeout");
+    stream.set_write_timeout(Some(PROCESS_BOUND)).expect("set write timeout");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )
+    .expect("write request line");
+    for (name, value) in headers {
+        write!(stream, "{name}: {value}\r\n").expect("write request header");
+    }
+    write!(stream, "\r\n{body}").expect("write request body");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read HTTP response");
+    let (head, body) = response.split_once("\r\n\r\n").expect("complete HTTP response");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("numeric HTTP status");
+    (status, body.to_owned())
+}
+
+fn post_json(address: SocketAddr, path: &str, user: Option<&str>, body: &str) -> (u16, Value) {
+    let mut headers = vec![("Content-Type", "application/json")];
+    if let Some(user) = user {
+        headers.push(("X-Sim-User", user));
+    }
+    let (status, body) = request(address, "POST", path, &headers, body);
+    (status, serde_json::from_str(&body).expect("JSON response"))
 }
 
 fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
@@ -115,4 +163,104 @@ fn occupied_bind_fails_without_starting_a_service() {
     let stderr = String::from_utf8(output.stderr).expect("utf8 stderr");
     assert!(stderr.contains("sim-server listener bind failed:"), "{stderr}");
     assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok());
+}
+
+#[test]
+fn offline_http_surface_is_local_bounded_and_stateful() {
+    let address = unused_loopback_addr();
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream tripwire");
+    upstream.set_nonblocking(true).expect("make upstream tripwire nonblocking");
+    let upstream_address = upstream.local_addr().expect("upstream tripwire address");
+
+    let child = server_command(address)
+        .env("SIM_ORACLE_INFO_URL", format!("http://{upstream_address}/info"))
+        .env("SIM_ORACLE_WSS_URL", format!("ws://{upstream_address}/ws"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn server");
+    let mut child = ChildGuard(child);
+    wait_for_response(address, "/readyz", "HTTP/1.1 200 OK\r\n");
+
+    let (status, meta) = post_json(address, "/info", None, r#"{"type":"meta"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(
+        meta,
+        json!({"universe":[{"name":"BTC","szDecimals":5},{"name":"ETH","szDecimals":4},{"name":"SOL","szDecimals":2}]})
+    );
+    let (status, mids) = post_json(address, "/info", None, r#"{"type":"allMids"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(mids, json!({"BTC":"100000","ETH":"3000","SOL":"150"}));
+    let (status, book) = post_json(address, "/info", None, r#"{"type":"l2Book","coin":"BTC"}"#);
+    assert_eq!(status, 200);
+    assert_eq!(book, json!({"coin":"BTC","time":0,"levels":[[],[]]}));
+
+    let open_orders = format!(r#"{{"type":"openOrders","user":"{BOB}"}}"#);
+    let (status, orders) = post_json(address, "/info", Some(ALICE), &open_orders);
+    assert_eq!(status, 200);
+    assert_eq!(orders, json!([]));
+
+    let order = format!(
+        r#"{{"action":{{"type":"order","orders":[{{"a":0,"b":true,"p":"99999.9","s":"0.00001","r":false,"t":{{"limit":{{"tif":"Gtc"}}}}}}],"grouping":"na"}},"nonce":900,"signature":{{"r":"{SIG}","s":"{SIG}","v":27}},"vaultAddress":null}}"#
+    );
+    let (status, ordered) = post_json(address, "/exchange", Some(ALICE), &order);
+    assert_eq!(status, 200);
+    assert_eq!(ordered["status"], "ok");
+    let statuses = ordered["response"]["data"]["statuses"].as_array().expect("ordered statuses");
+    assert_eq!(statuses.len(), 1);
+    let order_id = statuses[0]["resting"]["oid"].as_u64().expect("resting order id");
+
+    let (status, orders) = post_json(address, "/info", Some(ALICE), &open_orders);
+    assert_eq!(status, 200);
+    assert_eq!(
+        orders,
+        json!([{
+            "coin":"BTC", "limitPx":"99999.9", "oid":order_id, "side":"B",
+            "sz":"0.00001", "timestamp":1, "origSz":"0.00001", "cloid":null
+        }])
+    );
+
+    let cancel = format!(
+        r#"{{"action":{{"type":"cancel","cancels":[{{"a":0,"o":{order_id}}}]}},"nonce":901,"signature":{{"r":"{SIG}","s":"{SIG}","v":27}},"vaultAddress":null}}"#
+    );
+    let (status, cancelled) = post_json(address, "/exchange", Some(ALICE), &cancel);
+    assert_eq!(status, 200);
+    assert_eq!(cancelled["response"]["data"]["statuses"], json!(["success"]));
+    assert_eq!(post_json(address, "/info", Some(ALICE), &open_orders), (200, json!([])));
+
+    for content_type in [None, Some("text/plain")] {
+        let headers = content_type.map_or_else(Vec::new, |value| vec![("Content-Type", value)]);
+        let (status, body) = request(address, "POST", "/info", &headers, r#"{"type":"meta"}"#);
+        assert_eq!(status, 415);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("415 JSON"),
+            json!({"error":{"category":"invalid_request","message":"Content-Type must be application/json"}})
+        );
+    }
+    let (status, body) = post_json(address, "/info", Some("0x1234"), &open_orders);
+    assert_eq!(status, 401);
+    assert_eq!(
+        body,
+        json!({"error":{"category":"unauthorized_sim_user","message":"a normalized X-Sim-User header is required"}})
+    );
+
+    assert!(
+        wait_for_response(address, "/healthz", "HTTP/1.1 200 OK\r\n")
+            .ends_with("\r\n\r\n{\"status\":\"alive\"}")
+    );
+    assert!(
+        wait_for_response(address, "/readyz", "HTTP/1.1 200 OK\r\n")
+            .ends_with("\r\n\r\n{\"status\":\"ready\"}")
+    );
+    assert!(
+        matches!(upstream.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "offline mode must not expose any upstream request surface"
+    );
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(signal.success());
+    assert_eq!(wait_for_exit(&mut child.0).code(), Some(0));
 }
