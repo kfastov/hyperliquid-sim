@@ -5,12 +5,13 @@
 pub mod actors;
 
 use hl_wire::{AssetId, SimUserId};
-use oracle_hyperliquid::{ObservationReject, OracleFreshness, OracleObservation, OracleState};
+pub use oracle_hyperliquid::{Clock, ObservationSource, OracleFreshness, SystemClock};
+use oracle_hyperliquid::{ObservationReject, OracleObservation, OracleState};
 use sim_core::{
     AccountSnapshot, ApplyResult, BookSnapshot, Command, Engine, EngineSnapshot, EventRecord,
     EventSequence, OrderId, OrderSnapshot,
 };
-use std::{error::Error, fmt, num::NonZeroUsize, time::Duration};
+use std::{error::Error, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// Capacity limits for the runtime command queue and event fan-out.
@@ -31,6 +32,7 @@ impl RuntimeLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeRequest {
     ObserveOracle(OracleObservation),
+    OracleHealth,
     Apply(Command),
     EngineSnapshot,
     Book(AssetId),
@@ -44,6 +46,7 @@ pub enum RuntimeRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeReply {
     OracleObserved(Result<(), ObservationReject>),
+    OracleHealth(RuntimeOracleHealth),
     Applied(ApplyResult),
     EngineSnapshot(EngineSnapshot),
     Book(BookSnapshot),
@@ -51,6 +54,27 @@ pub enum RuntimeReply {
     Order(Option<OrderSnapshot>),
     Events(Vec<EventRecord>),
     Shutdown,
+}
+
+/// Freshness state for one supported oracle asset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OracleAssetHealth {
+    Missing {
+        asset: AssetId,
+    },
+    Observed {
+        asset: AssetId,
+        source: ObservationSource,
+        upstream_sequence: u64,
+        observed_at_ms: u64,
+        freshness: OracleFreshness,
+    },
+}
+
+/// Complete BTC/ETH/SOL oracle health computed from one runtime-clock reading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeOracleHealth {
+    pub assets: [OracleAssetHealth; 3],
 }
 
 /// Failures at the bounded runtime boundary.
@@ -214,8 +238,18 @@ impl RuntimeTask {
 /// Starts the only task that owns and mutates the deterministic engine.
 #[must_use]
 pub fn start_runtime(seed: u64, limits: RuntimeLimits) -> (RuntimeHandle, RuntimeTask) {
+    start_runtime_with_clock(seed, limits, Arc::new(SystemClock))
+}
+
+/// Starts the owner with an injected object-safe clock for deterministic composition.
+#[must_use]
+pub fn start_runtime_with_clock(
+    seed: u64,
+    limits: RuntimeLimits,
+    clock: Arc<dyn Clock>,
+) -> (RuntimeHandle, RuntimeTask) {
     let (handle, receiver, publisher) = bounded_runtime(limits);
-    let task = tokio::spawn(run_owner(Engine::new(seed), receiver, publisher));
+    let task = tokio::spawn(run_owner(Engine::new(seed), receiver, publisher, clock));
     (handle, RuntimeTask { task })
 }
 
@@ -223,6 +257,7 @@ async fn run_owner(
     mut engine: Engine,
     mut requests: mpsc::Receiver<RuntimeEnvelope>,
     publisher: RuntimeEventPublisher,
+    clock: Arc<dyn Clock>,
 ) {
     let mut oracle = OracleState::default();
     let mut last_sequence = None;
@@ -234,8 +269,11 @@ async fn run_owner(
             RuntimeRequest::ObserveOracle(observation) => {
                 Ok(RuntimeReply::OracleObserved(oracle.observe(*observation)))
             }
+            RuntimeRequest::OracleHealth => {
+                Ok(RuntimeReply::OracleHealth(oracle_health(&oracle, clock.now_ms())))
+            }
             RuntimeRequest::Apply(command) => {
-                if let Some(asset) = stale_placement_asset(command, &oracle) {
+                if let Some(asset) = stale_placement_asset(command, &oracle, clock.now_ms()) {
                     Err(RuntimeError::OracleStale(asset))
                 } else {
                     let result = engine.apply(command.clone());
@@ -276,13 +314,29 @@ async fn run_owner(
     publisher.publish(RuntimeEvent::Freshness(RuntimeFreshness::ShuttingDown { last_sequence }));
 }
 
-fn stale_placement_asset(command: &Command, oracle: &OracleState) -> Option<AssetId> {
-    let Command::PlaceBatch { timestamp, orders, .. } = command else {
+fn stale_placement_asset(command: &Command, oracle: &OracleState, now_ms: u64) -> Option<AssetId> {
+    let Command::PlaceBatch { orders, .. } = command else {
         return None;
     };
-    orders.iter().map(|order| order.asset).find(|asset| {
-        !matches!(oracle.freshness(*asset, *timestamp), OracleFreshness::Fresh { .. })
-    })
+    orders
+        .iter()
+        .map(|order| order.asset)
+        .find(|asset| !matches!(oracle.freshness(*asset, now_ms), OracleFreshness::Fresh { .. }))
+}
+
+fn oracle_health(oracle: &OracleState, now_ms: u64) -> RuntimeOracleHealth {
+    RuntimeOracleHealth {
+        assets: AssetId::ALL.map(|asset| match oracle.observation(asset) {
+            Some(observation) => OracleAssetHealth::Observed {
+                asset,
+                source: observation.source,
+                upstream_sequence: observation.upstream_sequence,
+                observed_at_ms: observation.observed_at_ms,
+                freshness: oracle.freshness(asset, now_ms),
+            },
+            None => OracleAssetHealth::Missing { asset },
+        }),
+    }
 }
 
 #[cfg(test)]

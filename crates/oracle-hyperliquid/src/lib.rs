@@ -7,7 +7,13 @@
 use hl_wire::{AssetId, DecimalScale, PriceTicks, WireValueError};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, error::Error, future::Future, pin::Pin, time::Duration};
+use std::{
+    collections::BTreeMap,
+    error::Error,
+    future::Future,
+    pin::Pin,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
 pub const STALE_AFTER_MS: u64 = 60_000;
@@ -216,8 +222,14 @@ pub enum ObservationReject {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OracleFreshness {
     Missing,
-    Fresh { age_ms: u64 },
-    Stale { age_ms: u64 },
+    Fresh {
+        age_ms: u64,
+    },
+    Stale {
+        age_ms: u64,
+    },
+    /// The observation is ahead of the runtime clock, including after a clock regression.
+    FutureObservation,
 }
 
 /// Independent last-known-good state for each supported asset.
@@ -248,7 +260,9 @@ impl OracleState {
         let Some(observation) = self.observation(asset) else {
             return OracleFreshness::Missing;
         };
-        let age_ms = now_ms.saturating_sub(observation.observed_at_ms);
+        let Some(age_ms) = now_ms.checked_sub(observation.observed_at_ms) else {
+            return OracleFreshness::FutureObservation;
+        };
         if age_ms > STALE_AFTER_MS {
             OracleFreshness::Stale { age_ms }
         } else {
@@ -260,6 +274,18 @@ impl OracleState {
 /// Clock seam used by ingestion tests and runtime composition.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> u64;
+}
+
+/// Production wall clock used by the runtime owner.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -414,6 +440,7 @@ mod tests {
         assert_eq!(state.observation(AssetId::BTC).expect("BTC retained").price.value(), 10_000);
         assert_eq!(state.observation(AssetId::ETH).expect("ETH retained").price.value(), 2_000);
         assert_eq!(state.freshness(AssetId::SOL, clock.now_ms()), OracleFreshness::Missing);
+        assert_eq!(state.freshness(AssetId::BTC, 999), OracleFreshness::FutureObservation);
     }
 
     struct FakeUpstream {
