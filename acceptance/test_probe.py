@@ -383,7 +383,7 @@ def private_fill(sequence, oid, side):
 
 class PrivateFlowTests(unittest.TestCase):
     def dependencies(self):
-        users = (probe.DEFAULT_USER, probe.DEFAULT_TAKER)
+        users = (probe.DEFAULT_USER, probe.DEFAULT_TAKER, probe.DEFAULT_UNRELATED)
         sockets = {}
         for user in users:
             subscription = {"type": "orderUpdates", "user": user}
@@ -421,13 +421,22 @@ class PrivateFlowTests(unittest.TestCase):
     def test_scripted_interleaving_proves_private_roles(self):
         http, sockets = self.dependencies()
         result = self.run_flow(http, sockets)
-        self.assertEqual(result, {"private_users": 2})
+        self.assertEqual(result, {"private_users": 2, "unrelated_leaks": 0})
         self.assertTrue(all(socket.closed for socket in sockets.values()))
         self.assertEqual([call[2] for call in http.calls], [probe.DEFAULT_USER, probe.DEFAULT_TAKER])
         for user, socket in sockets.items():
             self.assertEqual(socket.sent, [{
                 "method": "subscribe", "subscription": {"type": "orderUpdates", "user": user},
             }])
+
+    def test_scripted_private_flow_rejects_unrelated_leak_and_closes_every_socket(self):
+        http, sockets = self.dependencies()
+        sockets[probe.DEFAULT_UNRELATED].events.append(
+            order_update(7, 99, "open", price="100000")
+        )
+        with self.assertRaisesRegex(probe.ProbeFailure, "orderUpdates.*leak"):
+            self.run_flow(http, sockets)
+        self.assertTrue(all(socket.closed for socket in sockets.values()))
 
     def test_scripted_private_flow_rejects_wrong_user_on_either_socket(self):
         for socket_user, other_user in (
@@ -629,16 +638,42 @@ class RealOfflineProcessTest(unittest.TestCase):
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
-                timeout=15,
+                timeout=5,
                 check=False,
             )
             self.assertEqual(private.returncode, 0, private.stderr)
             private_lines = private.stdout.splitlines()
             self.assertEqual(len(private_lines), 1, private.stdout)
             private_summary = json.loads(private_lines[0])
-            self.assertEqual(private_summary["result"], "PASS")
-            self.assertEqual(private_summary["probe"], "B2b1")
-            self.assertEqual(private_summary["private_users"], 2)
+            elapsed_ms = private_summary.pop("elapsed_ms")
+            self.assertLess(elapsed_ms, 2_000)
+            self.assertEqual(private_summary, {
+                "checks": [
+                    "healthz",
+                    "readyz",
+                    "http_meta",
+                    "http_allMids",
+                    "http_l2Book",
+                    "ws_allMids",
+                    "ws_l2Book",
+                    "ws_orderUpdates",
+                    "ws_ping_pong",
+                    "ws_clean_close",
+                    "three_private_subscriptions_preopened",
+                    "exact_private_ack_and_initial_snapshot",
+                    "maker_private_placement_fill_terminal",
+                    "taker_private_placement_fill_terminal",
+                    "private_user_oid_correspondence",
+                    "private_sequence_positive_and_monotonic",
+                    "no_duplicate_private_terminal",
+                    "unrelated_private_isolation_window",
+                ],
+                "private_users": 2,
+                "probe": "B2b2",
+                "profile": "sim-header-v1",
+                "result": "PASS",
+                "unrelated_leaks": 0,
+            })
         finally:
             if server.poll() is None:
                 server.send_signal(signal.SIGTERM)

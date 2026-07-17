@@ -3,8 +3,9 @@
 
 The default (or explicit ``--state-flow``) preserves Probe-B1 placement/cancel.
 ``--trade-flow`` runs one public maker/taker BTC match. ``--private-flow``
-proves private maker/taker order-update correspondence. ``--basic-only`` runs
-only the Probe-A transport/snapshot path.
+proves private maker/taker order-update correspondence plus an unrelated-user
+negative isolation window. ``--basic-only`` runs only the Probe-A
+transport/snapshot path.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from urllib import error, parse, request
 
 DEFAULT_USER = "0x1111111111111111111111111111111111111111"
 DEFAULT_TAKER = "0x2222222222222222222222222222222222222222"
+DEFAULT_UNRELATED = "0x3333333333333333333333333333333333333333"
 SIGNATURE_COMPONENT = "0x" + "a" * 64
 DEFAULT_TIMEOUT = 5.0
 MAX_TIMEOUT = 30.0
@@ -791,12 +793,14 @@ def run_private_flow(
     maker: str,
     taker: str,
     websocket_factory: Any = WebSocketClient,
+    unrelated: str = DEFAULT_UNRELATED,
 ) -> dict[str, int]:
-    users = (maker, taker)
-    require(len(set(users)) == 2, "private users must be distinct")
+    private_users = (maker, taker)
+    users = (*private_users, unrelated)
+    require(len(set(users)) == 3, "private and unrelated users must be distinct")
     require(
         all(NORMALIZED_USER.fullmatch(user) is not None for user in users),
-        "private users must be normalized lowercase addresses",
+        "private and unrelated users must be normalized lowercase addresses",
     )
     sockets: dict[str, WebSocketClient] = {}
     initial_sequences: dict[str, int] = {}
@@ -873,9 +877,14 @@ def run_private_flow(
             ],
             timeout,
         )
+        unrelated_leaks = observe_unrelated_private_stream(
+            sockets[unrelated],
+            unrelated,
+            deadline=time.monotonic() + min(DUPLICATE_WINDOW, timeout),
+        )
         for ws in sockets.values():
             ws.close_cleanly()
-        return {"private_users": 2}
+        return {"private_users": len(private_users), "unrelated_leaks": unrelated_leaks}
     except Exception:
         for ws in sockets.values():
             ws.abort()
@@ -1018,16 +1027,17 @@ def run_probe(
     if basic_only:
         return summary
     if private_flow:
-        summary["probe"] = "B2b1"
+        summary["probe"] = "B2b2"
         summary.update(run_private_flow(HttpClient(base_url, timeout), ws_url, timeout, user, taker))
         summary["checks"].extend([
-            "two_private_subscriptions_preopened",
+            "three_private_subscriptions_preopened",
             "exact_private_ack_and_initial_snapshot",
             "maker_private_placement_fill_terminal",
             "taker_private_placement_fill_terminal",
             "private_user_oid_correspondence",
             "private_sequence_positive_and_monotonic",
             "no_duplicate_private_terminal",
+            "unrelated_private_isolation_window",
         ])
     elif trade_flow:
         summary["probe"] = "B2a"
@@ -1079,7 +1089,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--taker", default=DEFAULT_TAKER, help="normalized synthetic taker for trade/private flows")
     flow = parser.add_mutually_exclusive_group()
     flow.add_argument("--trade-flow", action="store_true", help="run the narrow Probe-B2a maker/taker trades path")
-    flow.add_argument("--private-flow", action="store_true", help="run Probe-B2b1 private maker/taker correspondence")
+    flow.add_argument("--private-flow", action="store_true", help="run Probe-B2b2 private correspondence and unrelated isolation")
     flow.add_argument("--state-flow", action="store_true", help="explicitly run the default one-user placement/cancel flow")
     flow.add_argument("--basic-only", action="store_true", help="run Probe-A transport/snapshots without changing state")
     args = parser.parse_args(argv)
@@ -1098,7 +1108,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.private_flow,
         )
     except Exception as exc:
-        failed_probe = "A" if args.basic_only else ("B2b1" if args.private_flow else ("B2a" if args.trade_flow else "B1"))
+        failed_probe = "A" if args.basic_only else ("B2b2" if args.private_flow else ("B2a" if args.trade_flow else "B1"))
         print(
             json.dumps(
                 {"result": "FAIL", "probe": failed_probe, "error": type(exc).__name__, "message": str(exc)},
