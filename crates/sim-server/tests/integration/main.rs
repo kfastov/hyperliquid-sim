@@ -49,6 +49,57 @@ fn server_command(address: SocketAddr) -> Command {
     command
 }
 
+fn complete_http_response_len(response: &[u8]) -> Option<usize> {
+    let header_end = response.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+    let head = std::str::from_utf8(&response[..header_end]).ok()?;
+    let content_length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    header_end.checked_add(content_length)
+}
+
+fn read_http_response(stream: &mut TcpStream) -> std::io::Result<String> {
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        if let Some(expected_len) = complete_http_response_len(&response)
+            && response.len() >= expected_len
+        {
+            response.truncate(expected_len);
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionReset
+                    && complete_http_response_len(&response)
+                        .is_some_and(|expected_len| response.len() >= expected_len) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let expected_len = complete_http_response_len(&response).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "HTTP response ended before complete headers and Content-Length body",
+        )
+    })?;
+    if response.len() < expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("HTTP response ended at {} of {expected_len} bytes", response.len()),
+        ));
+    }
+    String::from_utf8(response)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error()))
+}
+
 fn wait_for_response(address: SocketAddr, path: &str, expected_status: &str) -> String {
     let deadline = Instant::now() + PROCESS_BOUND;
     loop {
@@ -59,12 +110,18 @@ fn wait_for_response(address: SocketAddr, path: &str, expected_status: &str) -> 
                     "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                 )
                 .expect("write HTTP request");
-                let mut response = String::new();
-                stream.read_to_string(&mut response).expect("read HTTP response");
-                if response.starts_with(expected_status) {
-                    return response;
+                match read_http_response(&mut stream) {
+                    Ok(response) if response.starts_with(expected_status) => return response,
+                    Ok(response) => {
+                        assert!(Instant::now() < deadline, "unexpected response: {response}");
+                    }
+                    Err(error) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "HTTP listener did not return a complete response: {error}"
+                        );
+                    }
                 }
-                assert!(Instant::now() < deadline, "unexpected response: {response}");
                 thread::sleep(Duration::from_millis(20));
             }
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
@@ -95,8 +152,7 @@ fn request(
     }
     write!(stream, "\r\n{body}").expect("write request body");
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read HTTP response");
+    let response = read_http_response(&mut stream).expect("read complete HTTP response");
     let (head, body) = response.split_once("\r\n\r\n").expect("complete HTTP response");
     let status = head
         .lines()
