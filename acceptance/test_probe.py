@@ -23,6 +23,7 @@ from urllib import error
 
 ACCEPTANCE = Path(__file__).resolve().parent
 ROOT = ACCEPTANCE.parent
+UNRELATED = "0x3333333333333333333333333333333333333333"
 sys.path.insert(0, str(ACCEPTANCE))
 
 import probe  # noqa: E402
@@ -215,6 +216,19 @@ class ScriptedWebSocket:
 
     def abort(self):
         self.closed = True
+
+
+class ScriptedReceive:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.timeouts = []
+
+    def __call__(self, timeout):
+        self.timeouts.append(timeout)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 class ScriptedHttp:
@@ -455,6 +469,61 @@ class PrivateFlowTests(unittest.TestCase):
                     maker.events[1]["sequence"] = 0
                 with self.assertRaisesRegex(probe.ProbeFailure, message):
                     self.run_flow(http, sockets)
+
+
+class UnrelatedPrivateStreamTests(unittest.TestCase):
+    def observe(self, outcomes, unrelated=UNRELATED):
+        receive = ScriptedReceive(outcomes)
+        result = probe.observe_unrelated_private_stream(
+            receive,
+            unrelated,
+            deadline=10.25,
+            clock=lambda: 10.0,
+        )
+        return result, receive
+
+    def test_clean_timeout_passes_with_strict_remaining_window(self):
+        result, receive = self.observe([None])
+        self.assertEqual(result, 0)
+        self.assertEqual(receive.timeouts, [0.25])
+
+    def test_exact_application_pong_is_allowed_before_clean_timeout(self):
+        socket = ScriptedWebSocket([], [{"channel": "pong"}])
+        result = probe.observe_unrelated_private_stream(
+            socket,
+            UNRELATED,
+            deadline=10.25,
+            clock=lambda: 10.0,
+        )
+        self.assertEqual(result, 0)
+
+    def test_order_updates_payload_is_always_a_leak(self):
+        with self.assertRaisesRegex(probe.ProbeFailure, "orderUpdates.*leak"):
+            self.observe([order_update(7, 99, "open", price="100000")])
+
+    def test_channel_and_projection_error_envelopes_fail(self):
+        for message in (
+            {"channel": "error", "data": {"category": "lagged", "message": "resubscribe"}},
+            {"channel": "error", "data": {"category": "internal", "message": "event projection failed"}},
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(probe.ProbeFailure, "channel:error"):
+                self.observe([message])
+
+    def test_malformed_envelope_identity_and_unallowlisted_data_fail(self):
+        cases = (
+            (["not", "an", "envelope"], UNRELATED, "malformed envelope"),
+            ({"channel": "pong", "user": probe.DEFAULT_USER}, UNRELATED, "identity|unexpected envelope"),
+            ({"channel": "trades", "sequence": 9, "data": []}, UNRELATED, "unexpected envelope"),
+            ({"channel": "pong"}, "not-a-user", "normalized unrelated user"),
+        )
+        for message, unrelated, diagnostic in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(probe.ProbeFailure, diagnostic):
+                self.observe([message], unrelated)
+
+    def test_unexpected_close_fails(self):
+        close = probe.WebSocketEOF("WebSocket peer closed during frame read")
+        with self.assertRaisesRegex(probe.ProbeFailure, "unexpected close"):
+            self.observe([close])
 
 
 class RealOfflineProcessTest(unittest.TestCase):

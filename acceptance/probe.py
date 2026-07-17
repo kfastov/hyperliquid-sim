@@ -882,6 +882,59 @@ def run_private_flow(
         raise
 
 
+def observe_unrelated_private_stream(
+    source: Any,
+    unrelated_user: str,
+    deadline: float,
+    clock: Any = time.monotonic,
+) -> int:
+    """Observe an already-subscribed private stream until a clean timeout.
+
+    ``source`` may be a callable with ``poll_json(timeout)`` semantics or an
+    object exposing that method. Only the exact application-level pong is
+    ignorable; wire ping/pong is consumed below this projection boundary.
+    """
+    require(
+        type(unrelated_user) is str and NORMALIZED_USER.fullmatch(unrelated_user) is not None,
+        "isolation requires a normalized unrelated user",
+    )
+    receive = source.poll_json if hasattr(source, "poll_json") else source
+    require(callable(receive), "isolation source must be a receive callable or poll_json socket")
+
+    for _ in range(MAX_FILTERED_MESSAGES):
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return 0
+        try:
+            message = receive(remaining)
+        except WebSocketTimeout:
+            return 0
+        except WebSocketEOF as exc:
+            raise ProbeFailure("unexpected close during unrelated isolation window") from exc
+        if message is None:
+            return 0
+        if not isinstance(message, dict):
+            raise ProbeFailure(f"unrelated stream malformed envelope: {message!r}")
+
+        channel = message.get("channel")
+        if channel == "error":
+            raise ProbeFailure(f"channel:error on unrelated stream: {message!r}")
+        if channel == "orderUpdates":
+            raise ProbeFailure(f"unrelated orderUpdates event leak: {message!r}")
+
+        serialized = json.dumps(message, separators=(",", ":"), sort_keys=True)
+        payload_users = set(re.findall(r"0x[0-9a-f]{40}", serialized))
+        require(
+            not payload_users or payload_users == {unrelated_user},
+            f"unrelated stream contains wrong identity: {message!r}",
+        )
+        if message == {"channel": "pong"}:
+            continue
+        raise ProbeFailure(f"unrelated stream unexpected envelope: {message!r}")
+
+    raise ProbeFailure("unrelated isolation window exceeded bounded control-message allowance")
+
+
 def run_basic_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str, Any]:
     started = time.monotonic()
     http = HttpClient(base_url, timeout)
