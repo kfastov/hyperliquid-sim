@@ -14,6 +14,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -22,7 +23,7 @@ import struct
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib import error, parse, request
 
 DEFAULT_USER = "0x1111111111111111111111111111111111111111"
@@ -470,6 +471,124 @@ def validate_open_order(order: Any, oid: int) -> None:
     require_canonical(order["limitPx"], "99999.9", "open order limitPx")
     require_canonical(order["sz"], "0.00001", "open order sz")
     require_canonical(order["origSz"], "0.00001", "open order origSz")
+
+
+def run_stale_cancel_flow(
+    http: Any,
+    wait_seconds: float,
+    user: str,
+    sleeper: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, int]:
+    """Prove BTC placement stales while cancellation and queries stay available.
+
+    The HTTP boundary may be a client exposing ``post_json`` or an equivalent
+    injected callable. The sleeper and monotonic clock are injected so the
+    complete greater-than-60-second transcript is deterministic in unit tests.
+    This helper intentionally has no CLI wiring yet.
+    """
+    require(
+        type(user) is str and NORMALIZED_USER.fullmatch(user) is not None,
+        "stale flow requires a normalized lowercase user",
+    )
+    require(
+        type(wait_seconds) in (int, float)
+        and math.isfinite(wait_seconds)
+        and wait_seconds > 60.0,
+        "stale flow wait must be finite and strictly greater than 60 seconds",
+    )
+    post_json = http.post_json if hasattr(http, "post_json") else http
+    require(callable(post_json), "stale flow HTTP boundary must be a client or post_json callable")
+    require(callable(sleeper) and callable(clock), "stale flow sleeper and clock must be callable")
+
+    order_action = {
+        "type": "order",
+        "orders": [{
+            "a": 0, "b": True, "p": "99999.9", "s": "0.00001", "r": False,
+            "t": {"limit": {"tif": "Gtc"}},
+        }],
+        "grouping": "na",
+    }
+    placed_response = post_json("/exchange", exchange_envelope(order_action, 4000), user)
+    require(
+        isinstance(placed_response, HttpResponse),
+        "fresh BTC GTC placement returned malformed HTTP response",
+    )
+    placed = require_ok(placed_response, "fresh BTC GTC placement")
+    placement_status = ordered_status(placed, "order", "fresh BTC GTC placement")
+    require(
+        isinstance(placement_status, dict) and set(placement_status) == {"resting"},
+        "fresh BTC GTC placement did not return exact resting status",
+    )
+    resting = placement_status["resting"]
+    require(
+        isinstance(resting, dict)
+        and set(resting) == {"oid"}
+        and type(resting["oid"]) is int,
+        "fresh BTC GTC resting oid shape mismatch",
+    )
+    preserved_oid = resting["oid"]
+
+    started_raw = clock()
+    require(type(started_raw) in (int, float), "stale flow clock returned invalid time")
+    started = float(started_raw)
+    require(math.isfinite(started), "stale flow clock returned invalid time")
+    sleeper(wait_seconds)
+    ended_raw = clock()
+    require(type(ended_raw) in (int, float), "stale flow clock returned invalid time")
+    ended = float(ended_raw)
+    require(math.isfinite(ended), "stale flow clock returned invalid time")
+    require(ended - started >= wait_seconds, "stale flow wait ended before configured duration elapsed")
+
+    rejected = post_json("/exchange", exchange_envelope(order_action, 4001), user)
+    require(isinstance(rejected, HttpResponse), "stale BTC placement returned malformed HTTP response")
+    require(
+        rejected.status == 503,
+        f"stale BTC placement expected HTTP 503, got HTTP {rejected.status}",
+    )
+    require(
+        isinstance(rejected.body, dict) and set(rejected.body) == {"error"},
+        "stale BTC placement error envelope shape mismatch",
+    )
+    detail = rejected.body["error"]
+    require(
+        isinstance(detail, dict) and set(detail) == {"category", "message"},
+        "stale BTC placement error detail shape mismatch",
+    )
+    require(detail["category"] == "oracle_stale", "stale BTC placement error category mismatch")
+    require(
+        detail["message"] == "oracle observation is stale for BTC",
+        "stale placement error does not attribute BTC in the accepted envelope",
+    )
+
+    cancel_action = {"type": "cancel", "cancels": [{"a": 0, "o": preserved_oid}]}
+    canceled_response = post_json("/exchange", exchange_envelope(cancel_action, 4002), user)
+    require(
+        isinstance(canceled_response, HttpResponse),
+        "BTC cancel during staleness returned malformed HTTP response",
+    )
+    canceled = require_ok(canceled_response, "BTC cancel during staleness")
+    require(
+        ordered_status(canceled, "cancel", "BTC cancel during staleness") == "success",
+        "BTC cancel during staleness status mismatch",
+    )
+
+    remaining_response = post_json("/info", {"type": "openOrders", "user": user}, user)
+    require(
+        isinstance(remaining_response, HttpResponse),
+        "openOrders after stale cancel returned malformed HTTP response",
+    )
+    remaining = require_ok(remaining_response, "openOrders after stale cancel")
+    require(isinstance(remaining, list), "openOrders after stale cancel is not a list")
+    require(
+        all(isinstance(order, dict) and type(order.get("oid")) is int for order in remaining),
+        "openOrders after stale cancel contains malformed order",
+    )
+    require(
+        all(order["oid"] != preserved_oid for order in remaining),
+        "preserved oid remains in openOrders after stale cancel",
+    )
+    return {"placements": 1, "stale_rejections": 1, "cancels": 1}
 
 
 def run_state_flow(

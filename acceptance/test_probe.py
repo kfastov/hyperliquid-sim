@@ -238,7 +238,8 @@ class ScriptedHttp:
 
     def post_json(self, path, payload, user=None):
         self.calls.append((path, payload, user))
-        return probe.HttpResponse(200, self.bodies.pop(0))
+        outcome = self.bodies.pop(0)
+        return outcome if isinstance(outcome, probe.HttpResponse) else probe.HttpResponse(200, outcome)
 
 
 def exchange_response(kind, status):
@@ -250,6 +251,133 @@ def open_order(oid, price="99999.9", size="0.00001"):
         "coin": "BTC", "limitPx": price, "oid": oid, "side": "B", "sz": size,
         "timestamp": 1, "origSz": size, "cloid": None,
     }
+
+
+class FakeClock:
+    def __init__(self, now=10.0):
+        self.now = now
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.sleeps.append(duration)
+        self.now += duration
+
+
+class StaleCancelFlowTests(unittest.TestCase):
+    def dependencies(self):
+        http = ScriptedHttp([
+            exchange_response("order", {"resting": {"oid": 7}}),
+            probe.HttpResponse(503, {
+                "error": {
+                    "category": "oracle_stale",
+                    "message": "oracle observation is stale for BTC",
+                },
+            }),
+            exchange_response("cancel", "success"),
+            [],
+        ])
+        clock = FakeClock()
+        return http, clock
+
+    def run_flow(self, http, clock, wait_seconds=61.0, sleeper=None):
+        return probe.run_stale_cancel_flow(
+            http,
+            wait_seconds,
+            probe.DEFAULT_USER,
+            sleeper=clock.sleep if sleeper is None else sleeper,
+            clock=clock,
+        )
+
+    def test_happy_transcript_waits_then_rejects_placement_and_cancels_preserved_oid(self):
+        http, clock = self.dependencies()
+        result = self.run_flow(http, clock)
+        self.assertEqual(result, {"placements": 1, "stale_rejections": 1, "cancels": 1})
+        self.assertEqual(clock.sleeps, [61.0])
+        self.assertEqual([call[0] for call in http.calls], ["/exchange", "/exchange", "/exchange", "/info"])
+        self.assertTrue(all(call[2] == probe.DEFAULT_USER for call in http.calls))
+        self.assertEqual(http.calls[-1][1], {"type": "openOrders", "user": probe.DEFAULT_USER})
+        self.assertEqual(http.calls[2][1]["action"], {"type": "cancel", "cancels": [{"a": 0, "o": 7}]})
+
+        callable_http, callable_clock = self.dependencies()
+        self.assertEqual(
+            probe.run_stale_cancel_flow(
+                callable_http.post_json,
+                61.0,
+                probe.DEFAULT_USER,
+                sleeper=callable_clock.sleep,
+                clock=callable_clock,
+            ),
+            result,
+        )
+
+    def test_wait_must_be_strictly_greater_than_sixty_and_must_fully_elapse(self):
+        for wait_seconds in (60, 59.9):
+            with self.subTest(wait_seconds=wait_seconds):
+                http, clock = self.dependencies()
+                with self.assertRaisesRegex(probe.ProbeFailure, "greater than 60"):
+                    self.run_flow(http, clock, wait_seconds)
+                self.assertEqual(http.calls, [])
+
+        http, clock = self.dependencies()
+        with self.assertRaisesRegex(probe.ProbeFailure, "ended before"):
+            self.run_flow(http, clock, sleeper=lambda _duration: None)
+        self.assertEqual(len(http.calls), 1)
+
+    def test_early_success_fails_closed(self):
+        http, clock = self.dependencies()
+        http.bodies[1] = probe.HttpResponse(200, exchange_response("order", {"resting": {"oid": 8}}))
+        with self.assertRaisesRegex(probe.ProbeFailure, "expected HTTP 503"):
+            self.run_flow(http, clock)
+
+    def test_wrong_stale_status_category_or_asset_fails_closed(self):
+        cases = (
+            ("status", 429, "oracle_stale", "oracle observation is stale for BTC", "HTTP 503"),
+            ("category", 503, "overloaded", "oracle observation is stale for BTC", "category"),
+            ("asset", 503, "oracle_stale", "oracle observation is stale for ETH", "BTC"),
+        )
+        for name, status, category, message, diagnostic in cases:
+            with self.subTest(name=name):
+                http, clock = self.dependencies()
+                http.bodies[1] = probe.HttpResponse(status, {
+                    "error": {"category": category, "message": message},
+                })
+                with self.assertRaisesRegex(probe.ProbeFailure, diagnostic):
+                    self.run_flow(http, clock)
+
+    def test_malformed_stale_response_fails_closed(self):
+        malformed = (
+            [],
+            {"error": {"category": "oracle_stale"}},
+            {"error": {"category": "oracle_stale", "message": "oracle observation is stale for BTC", "asset": "BTC"}},
+        )
+        for body in malformed:
+            with self.subTest(body=body):
+                http, clock = self.dependencies()
+                http.bodies[1] = probe.HttpResponse(503, body)
+                with self.assertRaisesRegex(probe.ProbeFailure, "envelope shape|detail shape"):
+                    self.run_flow(http, clock)
+
+    def test_cancel_failure_or_wrong_cardinality_fails_closed(self):
+        http, clock = self.dependencies()
+        http.bodies[2] = probe.HttpResponse(503, {
+            "error": {"category": "internal", "message": "cancel unavailable"},
+        })
+        with self.assertRaisesRegex(probe.ProbeFailure, "BTC cancel during staleness returned HTTP 503"):
+            self.run_flow(http, clock)
+
+        http, clock = self.dependencies()
+        http.bodies[2]["response"]["data"]["statuses"].append("success")
+        with self.assertRaisesRegex(probe.ProbeFailure, "exactly one ordered status"):
+            self.run_flow(http, clock)
+
+    def test_preserved_oid_remaining_in_open_orders_fails_closed(self):
+        http, clock = self.dependencies()
+        http.bodies[3] = [open_order(7)]
+        with self.assertRaisesRegex(probe.ProbeFailure, "preserved oid remains"):
+            self.run_flow(http, clock)
 
 
 class StateFlowTests(unittest.TestCase):
