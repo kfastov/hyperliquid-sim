@@ -16,6 +16,7 @@ sim-core.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
+url = "2"
 
 [dev-dependencies]
 http-body-util.workspace = true
