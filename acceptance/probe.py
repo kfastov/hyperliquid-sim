@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stdlib-only external Probe-A/B1 plus an explicit narrow trade flow.
+"""Stdlib-only external Probe-A/B1 plus explicit trade/private flows.
 
 The default (or explicit ``--state-flow``) preserves Probe-B1 placement/cancel.
-``--trade-flow`` runs one maker/taker BTC match, while ``--basic-only`` runs
+``--trade-flow`` runs one public maker/taker BTC match. ``--private-flow``
+proves private maker/taker order-update correspondence. ``--basic-only`` runs
 only the Probe-A transport/snapshot path.
 """
 
@@ -665,6 +666,222 @@ def run_trade_flow(
         raise
 
 
+def _private_role(
+    message: Any,
+    expected_user: str,
+    expected_oid: int,
+    expected_side: str,
+    previous_sequence: int,
+) -> tuple[int, str] | None:
+    serialized = json.dumps(message, separators=(",", ":"), sort_keys=True)
+    if isinstance(message, dict) and message.get("channel") == "error":
+        raise ProbeFailure(f"channel:error on private socket for {expected_user}: {message!r}")
+    if not isinstance(message, dict) or message.get("channel") != "orderUpdates":
+        return None
+    payload_users = set(re.findall(r"0x[0-9a-f]{40}", serialized))
+    require(
+        not payload_users or payload_users == {expected_user},
+        f"private orderUpdates payload contains wrong user on {expected_user} socket",
+    )
+    require(set(message) == {"channel", "sequence", "data"}, "private orderUpdates envelope shape mismatch")
+    sequence = message["sequence"]
+    require(
+        type(sequence) is int and sequence > 0 and sequence > previous_sequence,
+        f"private orderUpdates sequence is nonpositive or regressed for {expected_user}",
+    )
+    data = message["data"]
+    require(isinstance(data, list) and len(data) == 1, "private orderUpdates cardinality mismatch")
+    update = data[0]
+    require(isinstance(update, dict), "private orderUpdates item is not an object")
+    status = update.get("status")
+    role = "placement" if status == "open" else status
+    require(role in {"placement", "fill", "filled"}, f"unexpected private orderUpdates status {status!r}")
+    expected_keys = {"order", "status", "statusTimestamp"} | ({"fill"} if role == "fill" else set())
+    require(set(update) == expected_keys, f"private orderUpdates item shape mismatch: {update!r}")
+    require(type(update["statusTimestamp"]) is int, "private orderUpdates statusTimestamp mismatch")
+    order = update["order"]
+    require(
+        isinstance(order, dict)
+        and set(order) == {"coin", "side", "limitPx", "sz", "oid", "timestamp", "origSz", "cloid"},
+        f"private owned order shape mismatch: {order!r}",
+    )
+    require(
+        order["oid"] == expected_oid,
+        f"private orderUpdates wrong oid on {expected_user} socket: expected {expected_oid}, got {order.get('oid')!r}",
+    )
+    require(order["coin"] == "BTC" and order["side"] == expected_side, "private order identity/role mismatch")
+    require(type(order["timestamp"]) is int and order["cloid"] is None, "private order timestamp/cloid mismatch")
+    require_canonical(order["limitPx"], "100000", "private order limitPx")
+    require_canonical(order["origSz"], "0.00001", "private order origSz")
+    require_canonical(order["sz"], "0.00001" if role == "placement" else "0", "private order remaining sz")
+    if role == "fill":
+        fill = update["fill"]
+        require(
+            isinstance(fill, dict) and set(fill) == {"tid", "side", "px", "sz"},
+            f"private fill shape mismatch: {fill!r}",
+        )
+        require(type(fill["tid"]) is int and fill["tid"] > 0, "private fill tid mismatch")
+        require(fill["side"] == expected_side, "private fill side mismatch")
+        require_canonical(fill["px"], "100000", "private fill price")
+        require_canonical(fill["sz"], "0.00001", "private fill quantity")
+    return sequence, role
+
+
+def _collect_private_roles(
+    ws: WebSocketClient,
+    timeout: float,
+    user: str,
+    oid: int,
+    side: str,
+    initial_sequence: int,
+) -> tuple[int, set[str]]:
+    deadline = time.monotonic() + timeout
+    previous_sequence = initial_sequence
+    roles: set[str] = set()
+    for _ in range(MAX_FILTERED_MESSAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        message = ws.poll_json(remaining)
+        if message is None:
+            break
+        result = _private_role(message, user, oid, side, previous_sequence)
+        if result is None:
+            continue
+        previous_sequence, role = result
+        if role == "filled" and role in roles:
+            raise ProbeFailure(f"duplicate terminal event for {user}")
+        if role == "fill" and role in roles:
+            raise ProbeFailure(f"duplicate fill event for {user}")
+        roles.add(role)
+        if roles == {"placement", "fill", "filled"}:
+            return previous_sequence, roles
+    missing = sorted({"placement", "fill", "filled"} - roles)
+    raise ProbeFailure(f"missing private roles for {user}: {','.join(missing)}")
+
+
+def _audit_private_duplicates(
+    sockets: list[tuple[WebSocketClient, str, int, str, int]],
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + min(DUPLICATE_WINDOW, timeout)
+    reads = 0
+    while time.monotonic() < deadline and reads < MAX_FILTERED_MESSAGES:
+        for ws, user, oid, side, sequence in sockets:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or reads >= MAX_FILTERED_MESSAGES:
+                break
+            message = ws.poll_json(min(0.02, remaining))
+            reads += 1
+            if message is None:
+                continue
+            result = _private_role(message, user, oid, side, sequence)
+            if result is None:
+                continue
+            _next_sequence, role = result
+            if role == "filled":
+                raise ProbeFailure(f"duplicate terminal event for {user}")
+            raise ProbeFailure(f"duplicate private {role} event for {user}")
+
+
+def run_private_flow(
+    http: HttpClient,
+    ws_url: str,
+    timeout: float,
+    maker: str,
+    taker: str,
+    websocket_factory: Any = WebSocketClient,
+) -> dict[str, int]:
+    users = (maker, taker)
+    require(len(set(users)) == 2, "private users must be distinct")
+    require(
+        all(NORMALIZED_USER.fullmatch(user) is not None for user in users),
+        "private users must be normalized lowercase addresses",
+    )
+    sockets: dict[str, WebSocketClient] = {}
+    initial_sequences: dict[str, int] = {}
+    try:
+        # Both private subscriptions exist before either state-changing HTTP call.
+        for user in users:
+            ws = websocket_factory(ws_url, timeout, user)
+            sockets[user] = ws
+            initial = subscribe(ws, {"type": "orderUpdates", "user": user}, "orderUpdates")
+            require(
+                set(initial) == {"channel", "sequence", "data"}
+                and type(initial["sequence"]) is int
+                and initial["sequence"] >= 0
+                and initial["data"] == [],
+                f"private flow initial orderUpdates mismatch for {user}: {initial!r}",
+            )
+            initial_sequences[user] = initial["sequence"]
+
+        maker_action = {
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": False, "p": "100000", "s": "0.00001", "r": False,
+                "t": {"limit": {"tif": "Gtc"}},
+            }],
+            "grouping": "na",
+        }
+        placed = require_ok(
+            http.post_json("/exchange", exchange_envelope(maker_action, 3000), maker),
+            "private maker BTC GTC placement",
+        )
+        maker_status = ordered_status(placed, "order", "private maker BTC GTC placement")
+        require(isinstance(maker_status, dict) and set(maker_status) == {"resting"}, "private maker did not rest")
+        resting = maker_status["resting"]
+        require(
+            isinstance(resting, dict) and set(resting) == {"oid"} and type(resting["oid"]) is int,
+            "private maker resting oid shape mismatch",
+        )
+        maker_oid = resting["oid"]
+
+        taker_action = {
+            "type": "order",
+            "orders": [{
+                "a": 0, "b": True, "p": "100000", "s": "0.00001", "r": False,
+                "t": {"limit": {"tif": "Ioc"}},
+            }],
+            "grouping": "na",
+        }
+        crossed = require_ok(
+            http.post_json("/exchange", exchange_envelope(taker_action, 3001), taker),
+            "private taker BTC IOC crossing placement",
+        )
+        taker_status = ordered_status(crossed, "order", "private taker BTC IOC crossing placement")
+        require(isinstance(taker_status, dict) and set(taker_status) == {"filled"}, "private taker did not fill")
+        filled = taker_status["filled"]
+        require(
+            isinstance(filled, dict) and set(filled) == {"totalSz", "avgPx", "oid"},
+            "private taker filled status shape mismatch",
+        )
+        taker_oid = filled["oid"]
+        require(type(taker_oid) is int and taker_oid != maker_oid, "private taker oid mismatch")
+        require_canonical(filled["totalSz"], "0.00001", "private HTTP filled quantity")
+        require_canonical(filled["avgPx"], "100000", "private HTTP maker price")
+
+        maker_sequence, _maker_roles = _collect_private_roles(
+            sockets[maker], timeout, maker, maker_oid, "A", initial_sequences[maker]
+        )
+        taker_sequence, _taker_roles = _collect_private_roles(
+            sockets[taker], timeout, taker, taker_oid, "B", initial_sequences[taker]
+        )
+        _audit_private_duplicates(
+            [
+                (sockets[maker], maker, maker_oid, "A", maker_sequence),
+                (sockets[taker], taker, taker_oid, "B", taker_sequence),
+            ],
+            timeout,
+        )
+        for ws in sockets.values():
+            ws.close_cleanly()
+        return {"private_users": 2}
+    except Exception:
+        for ws in sockets.values():
+            ws.abort()
+        raise
+
+
 def run_basic_probe(base_url: str, ws_url: str, timeout: float, user: str) -> dict[str, Any]:
     started = time.monotonic()
     http = HttpClient(base_url, timeout)
@@ -741,12 +958,25 @@ def run_probe(
     basic_only: bool = False,
     trade_flow: bool = False,
     taker: str = DEFAULT_TAKER,
+    private_flow: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     summary = run_basic_probe(base_url, ws_url, timeout, user)
     if basic_only:
         return summary
-    if trade_flow:
+    if private_flow:
+        summary["probe"] = "B2b1"
+        summary.update(run_private_flow(HttpClient(base_url, timeout), ws_url, timeout, user, taker))
+        summary["checks"].extend([
+            "two_private_subscriptions_preopened",
+            "exact_private_ack_and_initial_snapshot",
+            "maker_private_placement_fill_terminal",
+            "taker_private_placement_fill_terminal",
+            "private_user_oid_correspondence",
+            "private_sequence_positive_and_monotonic",
+            "no_duplicate_private_terminal",
+        ])
+    elif trade_flow:
         summary["probe"] = "B2a"
         summary.update(run_trade_flow(HttpClient(base_url, timeout), ws_url, timeout, user, taker))
         summary["checks"].extend([
@@ -792,10 +1022,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--base-url", required=True, help="HTTP(S) service origin")
     parser.add_argument("--ws-url", required=True, help="WS(S) service endpoint")
     parser.add_argument("--timeout", type=bounded_timeout, default=DEFAULT_TIMEOUT, help="per-I/O timeout in seconds (0.1-30)")
-    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user (maker for --trade-flow)")
-    parser.add_argument("--taker", default=DEFAULT_TAKER, help="normalized synthetic taker for --trade-flow")
+    parser.add_argument("--user", default=DEFAULT_USER, help="normalized synthetic user (maker for trade/private flows)")
+    parser.add_argument("--taker", default=DEFAULT_TAKER, help="normalized synthetic taker for trade/private flows")
     flow = parser.add_mutually_exclusive_group()
     flow.add_argument("--trade-flow", action="store_true", help="run the narrow Probe-B2a maker/taker trades path")
+    flow.add_argument("--private-flow", action="store_true", help="run Probe-B2b1 private maker/taker correspondence")
     flow.add_argument("--state-flow", action="store_true", help="explicitly run the default one-user placement/cancel flow")
     flow.add_argument("--basic-only", action="store_true", help="run Probe-A transport/snapshots without changing state")
     args = parser.parse_args(argv)
@@ -811,9 +1042,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.basic_only,
             args.trade_flow,
             args.taker,
+            args.private_flow,
         )
     except Exception as exc:
-        failed_probe = "A" if args.basic_only else ("B2a" if args.trade_flow else "B1")
+        failed_probe = "A" if args.basic_only else ("B2b1" if args.private_flow else ("B2a" if args.trade_flow else "B1"))
         print(
             json.dumps(
                 {"result": "FAIL", "probe": failed_probe, "error": type(exc).__name__, "message": str(exc)},

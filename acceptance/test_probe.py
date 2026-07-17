@@ -173,19 +173,22 @@ def subscription_ack(subscription):
     }
 
 
-def order_update(sequence, oid, status, price="99999.9", size="0.00001"):
-    return {
+def order_update(sequence, oid, status, price="99999.9", size="0.00001", side="B", fill=None):
+    result = {
         "channel": "orderUpdates",
         "sequence": sequence,
         "data": [{
             "order": {
-                "coin": "BTC", "side": "B", "limitPx": price, "sz": size,
-                "oid": oid, "timestamp": sequence, "origSz": size, "cloid": None,
+                "coin": "BTC", "side": side, "limitPx": price, "sz": size,
+                "oid": oid, "timestamp": sequence, "origSz": "0.00001", "cloid": None,
             },
             "status": status,
             "statusTimestamp": sequence,
         }],
     }
+    if fill is not None:
+        result["data"][0]["fill"] = fill
+    return result
 
 
 class ScriptedWebSocket:
@@ -203,6 +206,8 @@ class ScriptedWebSocket:
         return self.setup.pop(0) if self.setup else self.events.pop(0)
 
     def poll_json(self, _timeout):
+        if self.events:
+            return self.events.pop(0)
         return self.polled.pop(0) if self.polled else None
 
     def close_cleanly(self):
@@ -355,8 +360,105 @@ class TradeFlowTests(unittest.TestCase):
                     self.run_flow(http, ws)
 
 
+def private_fill(sequence, oid, side):
+    return order_update(
+        sequence, oid, "fill", price="100000", size="0", side=side,
+        fill={"tid": 9, "side": side, "px": "100000", "sz": "0.00001"},
+    )
+
+
+class PrivateFlowTests(unittest.TestCase):
+    def dependencies(self):
+        users = (probe.DEFAULT_USER, probe.DEFAULT_TAKER)
+        sockets = {}
+        for user in users:
+            subscription = {"type": "orderUpdates", "user": user}
+            sockets[user] = ScriptedWebSocket(
+                [subscription_ack(subscription), {"channel": "orderUpdates", "sequence": 0, "data": []}],
+                [],
+            )
+        # Harmless public-channel messages and a repeated placement prove that
+        # collection is bounded and semantic rather than adjacency-based.
+        sockets[probe.DEFAULT_USER].events.extend([
+            {"channel": "allMids", "sequence": 1, "data": {"BTC": "100000"}},
+            order_update(1, 7, "open", price="100000", side="A"),
+            order_update(2, 7, "open", price="100000", side="A"),
+            private_fill(4, 7, "A"),
+            order_update(5, 7, "filled", price="100000", size="0", side="A"),
+        ])
+        sockets[probe.DEFAULT_TAKER].events.extend([
+            {"channel": "l2Book", "sequence": 2, "data": {"coin": "BTC"}},
+            order_update(3, 8, "open", price="100000"),
+            private_fill(4, 8, "B"),
+            order_update(6, 8, "filled", price="100000", size="0"),
+        ])
+        http = ScriptedHttp([
+            exchange_response("order", {"resting": {"oid": 7}}),
+            exchange_response("order", {"filled": {"totalSz": "0.00001", "avgPx": "100000", "oid": 8}}),
+        ])
+        return http, sockets
+
+    def run_flow(self, http, sockets):
+        return probe.run_private_flow(
+            http, "ws://mock/ws", 0.1, probe.DEFAULT_USER, probe.DEFAULT_TAKER,
+            lambda _url, _timeout, user: sockets[user],
+        )
+
+    def test_scripted_interleaving_proves_private_roles(self):
+        http, sockets = self.dependencies()
+        result = self.run_flow(http, sockets)
+        self.assertEqual(result, {"private_users": 2})
+        self.assertTrue(all(socket.closed for socket in sockets.values()))
+        self.assertEqual([call[2] for call in http.calls], [probe.DEFAULT_USER, probe.DEFAULT_TAKER])
+        for user, socket in sockets.items():
+            self.assertEqual(socket.sent, [{
+                "method": "subscribe", "subscription": {"type": "orderUpdates", "user": user},
+            }])
+
+    def test_scripted_private_flow_rejects_wrong_user_on_either_socket(self):
+        for socket_user, other_user in (
+            (probe.DEFAULT_USER, probe.DEFAULT_TAKER),
+            (probe.DEFAULT_TAKER, probe.DEFAULT_USER),
+        ):
+            with self.subTest(socket_user=socket_user):
+                http, sockets = self.dependencies()
+                sockets[socket_user].events[1]["user"] = other_user
+                with self.assertRaisesRegex(probe.ProbeFailure, "wrong user"):
+                    self.run_flow(http, sockets)
+
+    def test_scripted_private_flow_rejects_error_wrong_oid_missing_role_duplicate_terminal_and_sequence(self):
+        cases = (
+            ("channel_error", "channel:error"),
+            ("wrong_oid", "wrong oid"),
+            ("missing_role", "missing.*fill"),
+            ("duplicate_terminal", "duplicate terminal"),
+            ("regressed_sequence", "regressed"),
+            ("nonpositive_sequence", "nonpositive"),
+        )
+        for change, message in cases:
+            with self.subTest(change=change):
+                http, sockets = self.dependencies()
+                maker = sockets[probe.DEFAULT_USER]
+                if change == "channel_error":
+                    maker.events[0] = {"channel": "error", "data": {"category": "internal"}}
+                elif change == "wrong_oid":
+                    maker.events[1]["data"][0]["order"]["oid"] = 8
+                elif change == "missing_role":
+                    maker.events = [event for event in maker.events if not (
+                        event.get("channel") == "orderUpdates" and event["data"][0]["status"] == "fill"
+                    )]
+                elif change == "duplicate_terminal":
+                    maker.polled.append(order_update(7, 7, "filled", price="100000", size="0", side="A"))
+                elif change == "regressed_sequence":
+                    maker.events[-1]["sequence"] = 3
+                else:
+                    maker.events[1]["sequence"] = 0
+                with self.assertRaisesRegex(probe.ProbeFailure, message):
+                    self.run_flow(http, sockets)
+
+
 class RealOfflineProcessTest(unittest.TestCase):
-    def test_current_offline_binary_passes_default_b1_and_trade_flow(self):
+    def test_current_offline_binary_passes_default_b1_trade_and_private_flows(self):
         binary = Path(os.environ.get("SIM_SERVER_BIN", ROOT / "target" / "debug" / "sim-server"))
         self.assertTrue(binary.is_file(), f"current binary missing; run cargo build --bin sim-server: {binary}")
         reservation = socket.socket()
@@ -442,6 +544,32 @@ class RealOfflineProcessTest(unittest.TestCase):
             self.assertEqual(trade_summary["probe"], "B2a")
             self.assertEqual(trade_summary["trades"], 1)
             self.assertIs(trade_summary["maker_price"], True)
+
+            private = subprocess.run(
+                [
+                    sys.executable,
+                    str(ACCEPTANCE / "probe.py"),
+                    "--base-url",
+                    f"http://127.0.0.1:{port}",
+                    "--ws-url",
+                    f"ws://127.0.0.1:{port}/ws",
+                    "--timeout",
+                    "2",
+                    "--private-flow",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(private.returncode, 0, private.stderr)
+            private_lines = private.stdout.splitlines()
+            self.assertEqual(len(private_lines), 1, private.stdout)
+            private_summary = json.loads(private_lines[0])
+            self.assertEqual(private_summary["result"], "PASS")
+            self.assertEqual(private_summary["probe"], "B2b1")
+            self.assertEqual(private_summary["private_users"], 2)
         finally:
             if server.poll() is None:
                 server.send_signal(signal.SIGTERM)
